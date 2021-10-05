@@ -14,21 +14,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macOS-latest, windows-latest, ubuntu-18.04]
+        os: [ubuntu-latest, macOS-latest]
         include:
         - os: ubuntu-latest
           cmake-args: -G "Unix Makefiles"
           build-args: --parallel
           package-file: DDNet-*-linux_x86_64.tar.xz
           fancy: true
-          env:
-            CFLAGS: -Wdeclaration-after-statement -Werror
-            CXXFLAGS: -Werror
-        - os: ubuntu-18.04
-          cmake-path: /usr/bin/
-          cmake-args: -G "Unix Makefiles"
-          package-file: DDNet-*-linux_x86_64.tar.xz
-          fancy: false
           env:
             CFLAGS: -Wdeclaration-after-statement -Werror
             CXXFLAGS: -Werror
@@ -40,14 +32,6 @@ jobs:
           env:
             CFLAGS: -Wdeclaration-after-statement -Werror
             CXXFLAGS: -Werror
-        - os: windows-latest
-          cmake-args: -G "Visual Studio 16 2019" -A x64
-          package-file: DDNet-*-win64.zip
-          fancy: false
-          env:
-            CFLAGS: /WX
-            CXXFLAGS: /WX
-            LDFLAGS: /WX
 
     steps:
     - uses: actions/checkout@v2
@@ -72,6 +56,7 @@ jobs:
         brew install pkg-config sdl2
         brew upgrade freetype
         sudo rm -rf /Library/Developer/CommandLineTools
+        find /Library/Developer/CommandLineTools
 
     - name: Build in debug mode
       env: ${{ matrix.env }}
