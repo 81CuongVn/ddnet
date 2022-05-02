@@ -1,0 +1,21 @@
+[package]
+name = "mastersrv"
+version = "0.0.1"
+authors = ["heinrich5991 <heinrich5991@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+base64 = "0.13.0"
+clap = "3.1.14"
+env_logger = "0.8.3"
+rand = "0.8.4"
+serde = { version = "1.0.126", features = ["derive"] }
+serde_json = { version = "1.0.64", features = [
+  "float_roundtrip",
+  "preserve_order",
+  "raw_value",
+] }
+sha2 = "0.10.0"
+tokio = { version = "1.6.0", features = ["macros", "rt", "rt-multi-thread"] }
+url = { version = "2.2.2", features = ["serde"] }
+warp = "0.3.1"
