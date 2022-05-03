@@ -12,6 +12,9 @@ public:
 	virtual ~IRegister() {}
 
 	virtual void Update() = 0;
+	// Call `OnConfigChange` if you change relevant config variables
+	// without going through the console.
+	virtual void OnConfigChange() = 0;
 	// Returns `true` if the packet was a packet related to registering
 	// code and doesn't have to processed furtherly.
 	virtual bool OnPacket(CNetChunk *pPacket) = 0;
@@ -19,6 +22,6 @@ public:
 	virtual void OnNewInfo(const char *pInfo) = 0;
 };
 
-IRegister *CreateRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int ServerPort);
+IRegister *CreateRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int ServerPort, unsigned SixupGlobalSecurityToken);
 
 #endif

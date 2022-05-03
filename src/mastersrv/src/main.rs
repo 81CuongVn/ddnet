@@ -35,21 +35,22 @@ use warp::Filter;
 struct Register {
     address: Url,
     secret: String,
+    connless_request_token: Option<String>,
     challenge_token: Option<String>,
     info_serial: String,
     info: json::Value,
 }
 
 #[derive(Debug, Serialize)]
-struct ChallengeHint {
-    hint: String,
+#[serde(rename_all = "snake_case", tag = "status")]
+enum RegisterResponse {
+    Success(RegisterResponseCommon),
+    NeedChallenge(RegisterResponseCommon),
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case", tag = "status")]
-enum RegisterResponse {
-    Success,
-    NeedChallenge(ChallengeHint),
+struct RegisterResponseCommon {
+    address: Url,
 }
 
 /// Time in milliseconds since the epoch of the timekeeper.
@@ -455,18 +456,28 @@ async fn handle_periodic_writeout(
 }
 
 async fn send_challenge(
+    connless_request_token_7: Option<[u8; 4]>,
     socket: Arc<tokio::net::UdpSocket>,
-    addr: SocketAddr,
+    target: SocketAddr,
     secret: String,
+    addr: Url,
     challenge: String,
 ) {
     let mut packet = Vec::with_capacity(128);
-    packet.extend_from_slice(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffchal");
+    if let Some(t) = connless_request_token_7 {
+        packet.extend_from_slice(b"\x21");
+        packet.extend_from_slice(&t);
+        packet.extend_from_slice(b"\xff\xff\xff\xff\xff\xff\xff\xffchal");
+    } else {
+        packet.extend_from_slice(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffchal");
+    }
     packet.extend_from_slice(secret.as_bytes());
+    packet.push(0);
+    packet.extend_from_slice(addr.as_str().as_bytes());
     packet.push(0);
     packet.extend_from_slice(challenge.as_bytes());
     packet.push(0);
-    socket.send_to(&packet, addr).await.unwrap();
+    socket.send_to(&packet, target).await.unwrap();
 }
 
 fn handle_register(
@@ -474,9 +485,19 @@ fn handle_register(
     remote_address: IpAddr,
     register: &Register,
 ) -> Result<RegisterResponse, RegisterError> {
-    if register.address.scheme() != "tw-0.6+udp" {
-        return Err("register address must start with tw-0.6+udp://".into());
-    }
+    let connless_request_token_7 = match register.address.scheme() {
+        "tw-0.5+udp" => None,
+        "tw-0.6+udp" => None,
+        "tw-0.7+udp" => {
+            let token_hex = register.connless_request_token.as_ref().ok_or_else(|| {
+                "registering with tw-0.7+udp:// requires field \"connless_request_token\""
+            })?;
+            let mut token = [0; 4];
+            hex::decode_to_slice(token_hex, &mut token).map_err(|e| RegisterError(format!("invalid hex in connless_request_token: {}", e)))?;
+            Some(token)
+        },
+        _ => return Err("register address must start with one of tw-0.5+udp://, tw-0.6+udp://, tw-0.7+udp://".into()),
+    };
     if register.address.host_str() != Some("connecting-address.invalid") {
         return Err("register address must have domain connecting-address.invalid".into());
     }
@@ -497,6 +518,7 @@ fn handle_register(
         .map(|ct| ct != challenge.current())
         .unwrap_or(true);
 
+    let common = RegisterResponseCommon { address: address.clone() };
     let result = if correct_challenge {
         let info = register.info.as_object().ok_or("register info must be an object")?;
 
@@ -506,25 +528,25 @@ fn handle_register(
 
         shared.lock_servers().add(
             shared.timekeeper.now(),
-            address,
+            address.clone(),
             register.secret.clone(),
             register.info_serial.clone(),
             raw_info
         );
 
-        RegisterResponse::Success
+        RegisterResponse::Success(common)
     } else {
-        RegisterResponse::NeedChallenge(ChallengeHint {
-            hint: challenge.current().into(),
-        })
+        RegisterResponse::NeedChallenge(common)
     };
 
     if should_send_challenge {
-        println!("sending challenge to {}:{}", remote_address, port);
+        println!("sending challenge to {}", address);
         tokio::spawn(send_challenge(
+            connless_request_token_7,
             shared.socket.clone(),
             SocketAddr::new(remote_address, port),
             register.secret.clone(),
+            address,
             challenge.current,
         ));
     }
@@ -617,6 +639,7 @@ async fn main() {
                 Ok(Ok(r)) => {
                     warp::http::Response::builder()
                         .status(warp::http::StatusCode::OK)
+                        .header("Content-Type", "application/json")
                         .body(r)
                 },
                 // TODO: better body

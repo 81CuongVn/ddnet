@@ -8,6 +8,7 @@ edition = "2018"
 base64 = "0.13.0"
 clap = "3.1.14"
 env_logger = "0.8.3"
+hex = "0.4.3"
 rand = "0.8.4"
 serde = { version = "1.0.126", features = ["derive"] }
 serde_json = { version = "1.0.64", features = [
