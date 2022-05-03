@@ -45,6 +45,7 @@ class CRegister : public IRegister
 		}
 
 		LOCK m_Lock = lock_create();
+		int m_InfoSerial GUARDED_BY(m_Lock) = -1;
 		int m_LatestSuccessfulInfoSerial GUARDED_BY(m_Lock) = -1;
 	};
 
@@ -124,7 +125,6 @@ class CRegister : public IRegister
 	char m_aVerifyPacket[sizeof(SERVERBROWSE_CHALLENGE) + UUID_MAXSTRSIZE];
 	CUuid m_Secret = RandomUuid();
 	bool m_GotServerInfo = false;
-	int m_InfoSerial = -1;
 	char m_aServerInfo[1024];
 
 public:
@@ -274,16 +274,21 @@ void CRegister::CProtocol::SendRegister()
 	char aSecret[UUID_MAXSTRSIZE];
 	FormatUuid(m_pParent->m_Secret, aSecret, sizeof(aSecret));
 
+	lock_wait(m_pShared->m_pGlobal->m_Lock);
+	int InfoSerial = m_pShared->m_pGlobal->m_InfoSerial;
+	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true;
+	lock_unlock(m_pShared->m_pGlobal->m_Lock);
+
 	char aInfoSerial[16];
 	// Make sure the info serial sorts alphabetically. Start with a0 to a9,
 	// continue with b10 to b99, c100 to c999 and so on.
-	str_format(aInfoSerial + 1, sizeof(aInfoSerial) - 1, "%d", m_pParent->m_InfoSerial);
+	str_format(aInfoSerial + 1, sizeof(aInfoSerial) - 1, "%d", InfoSerial);
 	aInfoSerial[0] = 'a' + str_length(aInfoSerial + 1) - 1;
 
-	const char *pSecurityTokenJson = "";
+	const char *pRequestTokenJson = "";
 	if(m_Protocol == PROTOCOL_TW7_IPV6 || m_Protocol == PROTOCOL_TW7_IPV4)
 	{
-		pSecurityTokenJson = m_pParent->m_aConnlessRequestTokenJson;
+		pRequestTokenJson = m_pParent->m_aConnlessRequestTokenJson;
 	}
 
 	// TODO: Don't send info if the master already knows it.
@@ -292,18 +297,19 @@ void CRegister::CProtocol::SendRegister()
 		"{"
 		"\"address\":\"%sconnecting-address.invalid:%d\","
 		"\"secret\":\"%s\","
-		"%s"
-		"%s"
-		"\"info_serial\":\"%s\","
-		"\"info\":%s"
+		"%s" // request token
+		"%s" // challenge token
+		"\"info_serial\":\"%s\""
+		"%s%s" // info
 		"%s}",
 		ProtocolToScheme(m_Protocol),
 		m_pParent->m_ServerPort,
 		aSecret,
-		pSecurityTokenJson,
+		pRequestTokenJson,
 		m_aChallengeTokenJson,
 		aInfoSerial,
-		m_pParent->m_aServerInfo,
+		SendInfo ? ",\"info\":" : "",
+		SendInfo ? m_pParent->m_aServerInfo : "",
 		m_pParent->m_aRegisterExtra);
 
 	std::unique_ptr<CHttpRequest> pRegister = HttpPostJson(m_pParent->m_pConfig->m_SvRegisterUrl, aJson);
@@ -311,7 +317,7 @@ void CRegister::CProtocol::SendRegister()
 	pRegister->IpResolve(ProtocolToIpresolve(m_Protocol));
 
 	log_debug(ProtocolToSystem(m_Protocol), "registering...");
-	m_pParent->m_pEngine->AddJob(std::make_shared<CJob>(m_Protocol, m_NumTotalRequests, m_pParent->m_InfoSerial, m_pShared, std::move(pRegister)));
+	m_pParent->m_pEngine->AddJob(std::make_shared<CJob>(m_Protocol, m_NumTotalRequests, InfoSerial, m_pShared, std::move(pRegister)));
 	m_NewChallengeToken = false;
 	m_NumTotalRequests += 1;
 
@@ -403,13 +409,16 @@ void CRegister::CProtocol::CJob::Run()
 		m_pShared->m_LatestResponseStatus = Status;
 	}
 	lock_unlock(m_pShared->m_Lock);
-	lock_wait(m_pShared->m_pGlobal->m_Lock);
-	if(m_InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial)
+	if(Status == STATUS_OK)
 	{
-		m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial = m_InfoSerial;
+		lock_wait(m_pShared->m_pGlobal->m_Lock);
+		if(m_InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial)
+		{
+			m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial = m_InfoSerial;
+		}
+		// TODO: resend info if the masterserver claims to not know ours
+		lock_unlock(m_pShared->m_pGlobal->m_Lock);
 	}
-	// TODO: resend info if the masterserver claims to not know ours
-	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 }
 
 CRegister::CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int ServerPort, unsigned SixupSecurityToken) :
@@ -428,6 +437,7 @@ CRegister::CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int
 	mem_copy(m_aVerifyPacket, SERVERBROWSE_CHALLENGE, HEADER_LEN);
 	FormatUuid(m_Secret, m_aVerifyPacket + HEADER_LEN, sizeof(m_aVerifyPacket) - HEADER_LEN);
 
+	// The DDNet code uses the `unsigned` security token in memory byte order.
 	unsigned char TokenBytes[4];
 	mem_copy(TokenBytes, &SixupSecurityToken, sizeof(TokenBytes));
 	str_format(m_aConnlessRequestTokenJson, sizeof(m_aConnlessRequestTokenJson),
@@ -473,9 +483,9 @@ void CRegister::OnConfigChange()
 	}
 	else
 	{
-		if(str_comp(pProtocols, "0") == 0)
+		for(auto &Enabled : m_aProtocolEnabled)
 		{
-			return;
+			Enabled = false;
 		}
 		char aBuf[16];
 		while((pProtocols = str_next_token(pProtocols, ",", aBuf, sizeof(aBuf))))
@@ -581,7 +591,9 @@ void CRegister::OnNewInfo(const char *pInfo)
 
 	m_GotServerInfo = true;
 	str_copy(m_aServerInfo, pInfo, sizeof(m_aServerInfo));
-	m_InfoSerial += 1;
+	lock_wait(m_pGlobal->m_Lock);
+	m_pGlobal->m_InfoSerial += 1;
+	lock_unlock(m_pGlobal->m_Lock);
 
 	// Immediately send new info if it changes, but at most once per second.
 	int64_t Now = time_get();

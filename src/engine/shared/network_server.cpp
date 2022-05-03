@@ -657,11 +657,9 @@ int CNetServer::Recv(CNetChunk *pChunk, SECURITY_TOKEN *pResponseToken)
 		{
 			if(m_RecvUnpacker.m_Data.m_Flags & NET_PACKETFLAG_CONNLESS)
 			{
-				dbg_msg("net", "got connless packet token=%08x global_token=%08x", Token, GetGlobalToken());
 				if(Sixup && Token != GetToken(Addr) && Token != GetGlobalToken())
 					continue;
 
-				dbg_msg("net", "not dropped!");
 				pChunk->m_Flags = NETSENDFLAG_CONNLESS;
 				pChunk->m_ClientID = -1;
 				pChunk->m_Address = Addr;

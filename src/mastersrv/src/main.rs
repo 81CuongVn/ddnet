@@ -26,7 +26,9 @@ use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
+use tokio::net::UnixListener;
 use tokio::time;
+use tokio_stream::wrappers::UnixListenerStream;
 use url::Url;
 use warp::Filter;
 
@@ -46,11 +48,26 @@ struct Register {
 enum RegisterResponse {
     Success(RegisterResponseCommon),
     NeedChallenge(RegisterResponseCommon),
+    NeedInfo(RegisterResponseCommon),
+    Error(RegisterError)
 }
 
 #[derive(Debug, Serialize)]
 struct RegisterResponseCommon {
     address: Url,
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterError {
+    message: Cow<'static, str>,
+}
+
+impl RegisterError {
+    fn new(s: String) -> RegisterError {
+        RegisterError {
+            message: Cow::Owned(s),
+        }
+    }
 }
 
 /// Time in milliseconds since the epoch of the timekeeper.
@@ -94,13 +111,28 @@ impl Timekeeper {
 
 #[derive(Debug, Serialize)]
 struct SerializedServers<'a> {
-    pub servers: Vec<&'a Server>,
+    pub servers: Vec<SerializedServer<'a>>,
 }
 
 impl<'a> SerializedServers<'a> {
     fn new() -> SerializedServers<'a> {
         SerializedServers {
             servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SerializedServer<'a> {
+    pub addresses: &'a [Url],
+    pub info: &'a json::value::RawValue,
+}
+
+impl<'a> From<&'a Server> for SerializedServer<'a> {
+    fn from(server: &'a Server) -> SerializedServer<'a> {
+        SerializedServer {
+            addresses: &server.addresses,
+            info: &server.info,
         }
     }
 }
@@ -120,16 +152,8 @@ impl<'a> From<&'a Server> for DumpServer<'a> {
     }
 }
 
-#[derive(Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DumpKind {
-    Backcompat,
-    Mastersrv,
-}
-
 #[derive(Deserialize, Serialize)]
 struct Dump<'a> {
-    pub kind: DumpKind,
     pub now: Timestamp,
     pub secrets: Cow<'a, HashMap<Url, SecretInfo>>,
     pub servers: HashMap<Cow<'a, str>, DumpServer<'a>>,
@@ -138,7 +162,6 @@ struct Dump<'a> {
 impl<'a> Dump<'a> {
     fn new(now: Timestamp, servers: &'a Servers) -> Dump<'a> {
         Dump {
-            kind: DumpKind::Mastersrv,
             now,
             secrets: Cow::Borrowed(&servers.secrets),
             servers: servers.servers.iter().map(|(secret, server)| {
@@ -146,17 +169,34 @@ impl<'a> Dump<'a> {
             }).collect(),
         }
     }
+    fn fixup_timestamps(&mut self, new_now: Timestamp) {
+        let self_now = self.now;
+        let translate_timestamp = |ts| new_now.difference_added(ts, self_now);
+        self.now = translate_timestamp(self.now);
+        for s_info in self.secrets.to_mut().values_mut() {
+            s_info.ping_time = translate_timestamp(s_info.ping_time);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EntryKind {
+    Backcompat,
+    Mastersrv,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 struct SecretInfo {
+    kind: EntryKind,
     ping_time: Timestamp,
     secret: String,
 }
 
 impl SecretInfo {
-    fn new(ping_time: Timestamp, secret: String) -> SecretInfo {
+    fn new(kind: EntryKind, ping_time: Timestamp, secret: String) -> SecretInfo {
         SecretInfo {
+            kind,
             ping_time,
             secret,
         }
@@ -241,6 +281,7 @@ impl Servers {
     }
     fn add(
         &mut self,
+        source: EntryKind,
         ping_time: Timestamp,
         address: Url,
         secret: String,
@@ -248,11 +289,22 @@ impl Servers {
         info: Box<json::value::RawValue>,
     ) {
         let insert_address;
-        let s_info = SecretInfo::new(ping_time, secret.clone());
-        // TODO: only insert if timestamp is newer
-        // TODO: only replace if not from backcompat
-        match self.secrets.insert(address.clone(), s_info) {
-            Some(old) => {
+        let s_info = SecretInfo::new(source, ping_time, secret.clone());
+        match self.secrets.entry(address.clone()) {
+            hash_map::Entry::Vacant(v) => {
+                v.insert(s_info);
+                insert_address = true;
+            },
+            hash_map::Entry::Occupied(mut o) => {
+                if source < o.get().kind {
+                    // Don't replace masterserver entries with stuff from backcompat.
+                    return;
+                }
+                if ping_time < o.get().ping_time {
+                    // Don't replace address info with older one.
+                    return;
+                }
+                let old = o.insert(s_info);
                 insert_address = old.secret != secret;
                 if insert_address {
                     let server = self.servers.get_mut(&old.secret).unwrap();
@@ -262,8 +314,7 @@ impl Servers {
                     }
                 }
             },
-            None => insert_address = true,
-        };
+        }
         match self.servers.entry(secret) {
             hash_map::Entry::Vacant(v) => {
                 assert!(insert_address);
@@ -302,12 +353,18 @@ impl Servers {
             }
         }
     }
-    fn merge(&mut self, dump_timestamp: Timestamp, other: &Dump) {
-        let translate_timestamp = |ts| dump_timestamp.difference_added(ts, other.now);
+    fn merge(&mut self, other: &Dump) {
         for (address, s_info) in other.secrets.iter() {
             let server = &other.servers[&*s_info.secret];
             // TODO: use cow
-            self.add(translate_timestamp(s_info.ping_time), address.clone(), s_info.secret.clone(), server.info_serial.clone().into_owned(), server.info.clone().into_owned());
+            self.add(
+                s_info.kind,
+                s_info.ping_time,
+                address.clone(),
+                s_info.secret.clone(),
+                server.info_serial.clone().into_owned(),
+                server.info.clone().into_owned()
+            );
         }
     }
 }
@@ -319,11 +376,11 @@ struct Server {
     pub info: Box<json::value::RawValue>,
 }
 
-struct RegisterError(String);
-
 impl From<&'static str> for RegisterError {
     fn from(s: &'static str) -> RegisterError {
-        RegisterError(s.to_owned())
+        RegisterError {
+            message: Cow::Borrowed(s),
+        }
     }
 }
 
@@ -334,9 +391,7 @@ async fn handle_periodic_reseed(challenger: Arc<Mutex<Challenger>>) {
     }
 }
 
-async fn read_dump_dir(path: &Path, timekeeper: Timekeeper)
-    -> Vec<(Timestamp, Dump<'static>)>
-{
+async fn read_dump_dir(path: &Path, timekeeper: Timekeeper) -> Vec<Dump<'static>> {
     // TODO: unwrap
     let mut dir_entries = fs::read_dir(path).await.unwrap();
     let mut dumps = Vec::new();
@@ -346,14 +401,15 @@ async fn read_dump_dir(path: &Path, timekeeper: Timekeeper)
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
-        let timestamp = timekeeper.from_system_time(entry.metadata().await.unwrap().modified().unwrap());
+        let timestamp = timekeeper.from_system_time(fs::metadata(&path).await.unwrap().modified().unwrap());
         buffer.clear();
         File::open(&path).await.unwrap().read_to_end(&mut buffer).await.unwrap();
-        let dump: Dump = json::from_slice(&buffer).unwrap();
-        dumps.push((path, timestamp, dump));
+        let mut dump: Dump = json::from_slice(&buffer).unwrap();
+        dump.fixup_timestamps(timestamp);
+        dumps.push((path, dump));
     }
-    dumps.sort_unstable_by(|(path1, ..), (path2, ..)| path1.cmp(path2));
-    dumps.into_iter().map(|(_, timestamp, dump)| (timestamp, dump)).collect()
+    dumps.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
+    dumps.into_iter().map(|(_, dump)| dump).collect()
 }
 
 async fn overwrite_atomically<P, Q>(filename: P, temp_filename: Q, content: &[u8])
@@ -412,26 +468,27 @@ async fn handle_periodic_writeout(
             if let Some((filename, filename_temp)) = &addresses_filename {
                 let mut non_backcompat_addresses = Vec::new();
                 non_backcompat_addresses.extend(servers.secrets.keys());
-                for &(timestamp, ref other_dump) in &other_dumps {
-                    // TODO: Check age.
-                    if other_dump.kind != DumpKind::Backcompat {
-                        non_backcompat_addresses.extend(other_dump.secrets.keys());
-                    }
+                let oldest = now.minus_seconds(30);
+                for other_dump in &other_dumps {
+                    non_backcompat_addresses.extend(other_dump.secrets.iter()
+                        .filter(|(_, s_info)| s_info.kind != EntryKind::Backcompat && s_info.ping_time >= oldest)
+                        .map(|(addr, _)| addr)
+                    );
                 }
                 non_backcompat_addresses.sort_unstable();
                 non_backcompat_addresses.dedup();
                 let json = json::to_string(&non_backcompat_addresses).unwrap();
                 overwrite_atomically(filename, filename_temp, json.as_bytes()).await.unwrap();
             }
-            for &(timestamp, ref other_dump) in &other_dumps {
-                servers.merge(timestamp, &other_dump);
+            for other_dump in &other_dumps {
+                servers.merge(other_dump);
             }
             drop(other_dumps);
             let json = {
                 let mut serialized = SerializedServers::new();
                 servers.prune_before(now.minus_seconds(30));
-                serialized.servers.extend(servers.servers.values());
-                // TODO: remove info serials from JSON object
+                serialized.servers.extend(servers.servers.values().map(From::from));
+                serialized.servers.sort_by_key(|s| s.addresses);
                 json::to_string(&serialized).unwrap()
             };
             overwrite_atomically(&servers_filename, servers_filename_temp, json.as_bytes()).await.unwrap();
@@ -493,7 +550,7 @@ fn handle_register(
                 "registering with tw-0.7+udp:// requires field \"connless_request_token\""
             })?;
             let mut token = [0; 4];
-            hex::decode_to_slice(token_hex, &mut token).map_err(|e| RegisterError(format!("invalid hex in connless_request_token: {}", e)))?;
+            hex::decode_to_slice(token_hex, &mut token).map_err(|e| RegisterError::new(format!("invalid hex in connless_request_token: {}", e)))?;
             Some(token)
         },
         _ => return Err("register address must start with one of tw-0.5+udp://, tw-0.6+udp://, tw-0.7+udp://".into()),
@@ -527,6 +584,7 @@ fn handle_register(
         let raw_info = json::value::RawValue::from_string(raw_info).unwrap();
 
         shared.lock_servers().add(
+            EntryKind::Mastersrv,
             shared.timekeeper.now(),
             address.clone(),
             register.secret.clone(),
@@ -571,6 +629,18 @@ async fn main() {
             .default_value("[::]:8080")
             .help("Listen address for the HTTP endpoint.")
         )
+        .arg(Arg::new("listen-unix")
+            .long("listen-unix")
+            .value_name("PATH")
+            .requires("real-ip-header")
+            .conflicts_with("listen")
+            .help("Listen on the specified Unix domain socket.")
+        )
+        .arg(Arg::new("real-ip-header")
+            .long("real-ip-header")
+            .value_name("HEADER")
+            .help("HTTP header to use to determine the client IP address")
+        )
         .arg(Arg::new("write-addresses")
             .long("write-addresses")
             .value_name("FILENAME")
@@ -596,6 +666,8 @@ async fn main() {
         .get_matches();
 
     let listen_address: SocketAddr = matches.value_of_t_or_exit("listen");
+    let real_ip_header = matches.value_of("real-ip-header").map(|s| s.to_owned());
+    let listen_unix = matches.value_of("listen-unix");
 
     let challenger = Arc::new(Mutex::new(Challenger::new()));
     let servers = Arc::new(Mutex::new(Servers::new()));
@@ -612,19 +684,32 @@ async fn main() {
         timekeeper,
     ));
 
+    // TODO: put all fields except the server info into http headers for better
+    // HPACK/QPACK compression?
     let register = warp::post()
         .and(warp::path("register"))
+        .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
         .and(warp::body::json())
-        .map(move |addr: Option<SocketAddr>, register: Register| {
-            match panic::catch_unwind(|| {
+        .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, register: Register| {
+            let (http_status, body) = match panic::catch_unwind(|| {
                 let shared = Shared {
                     challenger: &challenger,
                     servers: &servers,
                     socket: &socket.0,
                     timekeeper: timekeeper,
                 };
-                let mut addr = addr.unwrap().ip();
+                let mut addr = if let Some(header) = &real_ip_header {
+                    headers
+                        .get(header)
+                        .ok_or_else(|| RegisterError::new(format!("missing {} header", header)))?
+                        .to_str()
+                        .map_err(|_| RegisterError::from("non-ASCII in real IP header"))?
+                        .parse()
+                        .map_err(|e| RegisterError::new(format!("{}", e)))?
+                } else {
+                    addr.unwrap().ip()
+                };
                 if let IpAddr::V6(v6) = addr {
                     if let Some(v4) = v6.to_ipv4() {
                         // TODO: switch to `to_ipv4_mapped` in the future.
@@ -634,29 +719,20 @@ async fn main() {
                     }
                 }
                 handle_register(shared, addr, &register)
-                    .map(|r| json::to_string(&r).unwrap())
             }) {
-                Ok(Ok(r)) => {
-                    warp::http::Response::builder()
-                        .status(warp::http::StatusCode::OK)
-                        .header("Content-Type", "application/json")
-                        .body(r)
-                },
-                // TODO: better body
-                Ok(Err(e)) => {
-                    warp::http::Response::builder()
-                        .status(warp::http::StatusCode::BAD_REQUEST)
-                        .body(e.0)
-                },
-                // TODO: better body
-                Err(_) => {
-                    warp::http::Response::builder()
-                        .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
-                        .body("".into())
-                },
-            }
+                Ok(Ok(r)) => (warp::http::StatusCode::OK, r),
+                Ok(Err(e)) => (warp::http::StatusCode::BAD_REQUEST, RegisterResponse::Error(e)),
+                Err(_) => (warp::http::StatusCode::INTERNAL_SERVER_ERROR, RegisterResponse::Error("unexpected panic".into())),
+            };
+            warp::http::Response::builder()
+                .status(http_status)
+                .body(json::to_string(&body).unwrap())
         });
-    warp::serve(register)
-        .run(listen_address)
-        .await
+    let server = warp::serve(register);
+    if let Some(path) = listen_unix {
+        let _ = fs::remove_file(path).await;
+        server.run_incoming(UnixListenerStream::new(UnixListener::bind(path).unwrap())).await
+    } else {
+        server.run(listen_address).await
+    }
 }
