@@ -9,6 +9,7 @@ use serde_json as json;
 use sha2::Digest;
 use sha2::Sha512_256 as SecureHash;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map;
 use std::ffi::OsStr;
@@ -34,6 +35,9 @@ use tokio::time;
 use url::Url;
 use warp::Filter;
 
+#[macro_use]
+extern crate log;
+
 use crate::addr::Addr;
 use crate::addr::Protocol;
 use crate::locations::Location;
@@ -43,6 +47,8 @@ use crate::locations::Locations;
 // (e.g. serialized) identifiers.
 mod addr;
 mod locations;
+
+const SERVER_TIMEOUT_SECONDS: u64 = 30;
 
 type ShortString = ArrayString<64>;
 
@@ -172,17 +178,20 @@ impl<'a> From<&'a Server> for DumpServer<'a> {
 #[derive(Deserialize, Serialize)]
 struct Dump<'a> {
     pub now: Timestamp,
-    pub addresses: Cow<'a, HashMap<Addr, AddrInfo>>,
-    pub servers: HashMap<Cow<'a, str>, DumpServer<'a>>,
+    // Use `BTreeMap`s so the serialization is stable.
+    pub addresses: BTreeMap<Addr, AddrInfo>,
+    pub servers: BTreeMap<ShortString, DumpServer<'a>>,
 }
 
 impl<'a> Dump<'a> {
     fn new(now: Timestamp, servers: &'a Servers) -> Dump<'a> {
         Dump {
             now,
-            addresses: Cow::Borrowed(&servers.addresses),
+            addresses: servers.addresses.iter().map(|(&addr, a_info)| {
+                (addr, a_info.clone())
+            }).collect(),
             servers: servers.servers.iter().map(|(secret, server)| {
-                (Cow::Borrowed(&**secret), DumpServer::from(server))
+                (secret.clone(), DumpServer::from(server))
             }).collect(),
         }
     }
@@ -190,7 +199,7 @@ impl<'a> Dump<'a> {
         let self_now = self.now;
         let translate_timestamp = |ts| new_now.difference_added(ts, self_now);
         self.now = translate_timestamp(self.now);
-        for a_info in self.addresses.to_mut().values_mut() {
+        for a_info in self.addresses.values_mut() {
             a_info.ping_time = translate_timestamp(a_info.ping_time);
         }
     }
@@ -299,7 +308,7 @@ impl Servers {
         a_info: AddrInfo,
         info_serial: i64,
         info: Cow<'_, json::value::RawValue>,
-    ) {
+    ) -> bool {
         let insert_addr;
         let secret = a_info.secret.clone();
         match self.addresses.entry(addr) {
@@ -310,11 +319,11 @@ impl Servers {
             hash_map::Entry::Occupied(mut o) => {
                 if a_info.kind < o.get().kind {
                     // Don't replace masterserver entries with stuff from backcompat.
-                    return;
+                    return false;
                 }
                 if a_info.ping_time < o.get().ping_time {
                     // Don't replace address info with older one.
-                    return;
+                    return false;
                 }
                 let old = o.insert(a_info);
                 insert_addr = old.secret != secret;
@@ -348,8 +357,9 @@ impl Servers {
                 }
             },
         }
+        insert_addr
     }
-    fn prune_before(&mut self, time: Timestamp) {
+    fn prune_before(&mut self, time: Timestamp, log: bool) {
         let mut remove = Vec::new();
         for (&addr, a_info) in &self.addresses {
             if a_info.ping_time < time {
@@ -357,6 +367,9 @@ impl Servers {
             }
         }
         for addr in remove {
+            if log {
+                debug!("removing {} due to timeout", addr);
+            }
             let secret = self.addresses.remove(&addr).unwrap().secret;
             let server = self.servers.get_mut(&secret).unwrap();
             server.addresses.retain(|&a| a != addr);
@@ -366,7 +379,7 @@ impl Servers {
         }
     }
     fn merge(&mut self, other: &Dump) {
-        for (&addr, a_info) in &*other.addresses {
+        for (&addr, a_info) in &other.addresses {
             let server = &other.servers[&*a_info.secret];
             self.add(
                 addr,
@@ -442,9 +455,6 @@ async fn handle_periodic_writeout(
     servers_filename: String,
     timekeeper: Timekeeper,
 ) {
-    let mut prev: Option<String> = None;
-    let mut printed_ellipsis = false;
-
     let dump_filename = dump_filename.map(|f| {
         let tmp = format!("{}.tmp.{}", f, process::id());
         (f, tmp)
@@ -462,7 +472,7 @@ async fn handle_periodic_writeout(
         let now = timekeeper.now();
         let mut servers = {
             let mut servers = servers.lock().unwrap_or_else(|poison| poison.into_inner());
-            servers.prune_before(now.minus_seconds(30));
+            servers.prune_before(now.minus_seconds(SERVER_TIMEOUT_SECONDS), true);
             servers.clone()
         };
         if let Some((filename, filename_temp)) = &dump_filename {
@@ -477,7 +487,7 @@ async fn handle_periodic_writeout(
             if let Some((filename, filename_temp)) = &addresses_filename {
                 let mut non_backcompat_addrs: Vec<Addr> = Vec::new();
                 non_backcompat_addrs.extend(servers.addresses.keys());
-                let oldest = now.minus_seconds(30);
+                let oldest = now.minus_seconds(SERVER_TIMEOUT_SECONDS);
                 for other_dump in &other_dumps {
                     non_backcompat_addrs.extend(other_dump.addresses.iter()
                         .filter(|(_, a_info)| a_info.kind != EntryKind::Backcompat && a_info.ping_time >= oldest)
@@ -495,7 +505,7 @@ async fn handle_periodic_writeout(
             drop(other_dumps);
             let json = {
                 let mut serialized = SerializedServers::new();
-                servers.prune_before(now.minus_seconds(30));
+                servers.prune_before(now.minus_seconds(SERVER_TIMEOUT_SECONDS), false);
                 serialized.servers.extend(servers.servers.values().map(|s| {
                     // Get the location of the first registered address. Since
                     // the addresses are kept sorted, this is stable.
@@ -509,14 +519,6 @@ async fn handle_periodic_writeout(
                 json::to_string(&serialized).unwrap()
             };
             overwrite_atomically(&servers_filename, servers_filename_temp, json.as_bytes()).await.unwrap();
-            if prev.as_ref().map(|p| p.get(16..) != json.get(16..)).unwrap_or(true) {
-                println!("{}", json);
-                prev = Some(json);
-                printed_ellipsis = false;
-            } else if !printed_ellipsis {
-                println!("...");
-                printed_ellipsis = true;
-            }
         }
         let elapsed = start.elapsed();
         if elapsed.as_secs() <= iteration {
@@ -601,7 +603,7 @@ fn handle_register(
         let raw_info = json::to_string(&info).unwrap();
         let raw_info = json::value::RawValue::from_string(raw_info).unwrap();
 
-        shared.lock_servers().add(
+        if shared.lock_servers().add(
             addr,
             AddrInfo {
                 kind: EntryKind::Mastersrv,
@@ -611,7 +613,9 @@ fn handle_register(
             },
             register.info_serial,
             Cow::Owned(raw_info),
-        );
+        ) {
+            debug!("successfully registered {}", addr);
+        }
 
         RegisterResponse::Success(common)
     } else {
@@ -619,7 +623,11 @@ fn handle_register(
     };
 
     if should_send_challenge {
-        println!("sending challenge to {}", addr);
+        if let RegisterResponse::Success(_) = result {
+            debug!("re-sending challenge to {}", addr);
+        } else {
+            debug!("sending challenge to {}", addr);
+        }
         tokio::spawn(send_challenge(
             connless_request_token_7,
             shared.socket.clone(),
@@ -764,10 +772,11 @@ async fn main() {
                 Ok(Err(e)) => (warp::http::StatusCode::BAD_REQUEST, RegisterResponse::Error(e)),
                 Err(_) => (warp::http::StatusCode::INTERNAL_SERVER_ERROR, RegisterResponse::Error("unexpected panic".into())),
             };
+            let body = json::to_string(&body).unwrap();
             // TODO: better error responses when generated by warp
             warp::http::Response::builder()
                 .status(http_status)
-                .body(json::to_string(&body).unwrap())
+                .body(body)
         });
     let server = warp::serve(register);
 
