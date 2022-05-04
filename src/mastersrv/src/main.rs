@@ -1,3 +1,5 @@
+use arrayvec::ArrayString;
+use arrayvec::ArrayVec;
 use clap::Arg;
 use clap::Command;
 use rand::random;
@@ -10,6 +12,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::io;
 use std::mem;
 use std::net::IpAddr;
@@ -17,6 +20,7 @@ use std::net::SocketAddr;
 use std::panic;
 use std::path::Path;
 use std::process;
+use std::str;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync;
@@ -32,14 +36,27 @@ use tokio_stream::wrappers::UnixListenerStream;
 use url::Url;
 use warp::Filter;
 
-// TODO: limit sizes, e.g. secret
+use crate::addr::Addr;
+use crate::addr::Protocol;
+use crate::locations::Location;
+use crate::locations::Locations;
+
+// Naming convention: Always use the abbreviation `addr` except in user-facing
+// (e.g. serialized) identifiers.
+mod addr;
+mod locations;
+
+type ShortString = ArrayString<64>;
+
+// TODO: make it compile on Windows
+
 #[derive(Debug, Deserialize)]
 struct Register {
     address: Url,
-    secret: String,
-    connless_request_token: Option<String>,
-    challenge_token: Option<String>,
-    info_serial: String,
+    secret: ShortString,
+    connless_request_token: Option<ShortString>,
+    challenge_token: Option<ShortString>,
+    info_serial: i64,
     info: json::Value,
 }
 
@@ -48,13 +65,12 @@ struct Register {
 enum RegisterResponse {
     Success(RegisterResponseCommon),
     NeedChallenge(RegisterResponseCommon),
-    NeedInfo(RegisterResponseCommon),
     Error(RegisterError)
 }
 
 #[derive(Debug, Serialize)]
 struct RegisterResponseCommon {
-    address: Url,
+    address: Addr,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,14 +140,17 @@ impl<'a> SerializedServers<'a> {
 
 #[derive(Debug, Serialize)]
 struct SerializedServer<'a> {
-    pub addresses: &'a [Url],
+    pub addresses: &'a [Addr],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
     pub info: &'a json::value::RawValue,
 }
 
-impl<'a> From<&'a Server> for SerializedServer<'a> {
-    fn from(server: &'a Server) -> SerializedServer<'a> {
+impl<'a> SerializedServer<'a> {
+    fn new(server: &'a Server, location: Option<Location>) -> SerializedServer<'a> {
         SerializedServer {
             addresses: &server.addresses,
+            location,
             info: &server.info,
         }
     }
@@ -139,14 +158,14 @@ impl<'a> From<&'a Server> for SerializedServer<'a> {
 
 #[derive(Deserialize, Serialize)]
 struct DumpServer<'a> {
-    pub info_serial: Cow<'a, str>,
+    pub info_serial: i64,
     pub info: Cow<'a, json::value::RawValue>,
 }
 
 impl<'a> From<&'a Server> for DumpServer<'a> {
     fn from(server: &'a Server) -> DumpServer<'a> {
         DumpServer {
-            info_serial: Cow::Borrowed(&server.info_serial),
+            info_serial: server.info_serial,
             info: Cow::Borrowed(&server.info),
         }
     }
@@ -155,7 +174,7 @@ impl<'a> From<&'a Server> for DumpServer<'a> {
 #[derive(Deserialize, Serialize)]
 struct Dump<'a> {
     pub now: Timestamp,
-    pub secrets: Cow<'a, HashMap<Url, SecretInfo>>,
+    pub addresses: Cow<'a, HashMap<Addr, AddrInfo>>,
     pub servers: HashMap<Cow<'a, str>, DumpServer<'a>>,
 }
 
@@ -163,7 +182,7 @@ impl<'a> Dump<'a> {
     fn new(now: Timestamp, servers: &'a Servers) -> Dump<'a> {
         Dump {
             now,
-            secrets: Cow::Borrowed(&servers.secrets),
+            addresses: Cow::Borrowed(&servers.addresses),
             servers: servers.servers.iter().map(|(secret, server)| {
                 (Cow::Borrowed(&**secret), DumpServer::from(server))
             }).collect(),
@@ -173,8 +192,8 @@ impl<'a> Dump<'a> {
         let self_now = self.now;
         let translate_timestamp = |ts| new_now.difference_added(ts, self_now);
         self.now = translate_timestamp(self.now);
-        for s_info in self.secrets.to_mut().values_mut() {
-            s_info.ping_time = translate_timestamp(s_info.ping_time);
+        for a_info in self.addresses.to_mut().values_mut() {
+            a_info.ping_time = translate_timestamp(a_info.ping_time);
         }
     }
 }
@@ -187,30 +206,22 @@ enum EntryKind {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-struct SecretInfo {
+struct AddrInfo {
     kind: EntryKind,
     ping_time: Timestamp,
-    secret: String,
-}
-
-impl SecretInfo {
-    fn new(kind: EntryKind, ping_time: Timestamp, secret: String) -> SecretInfo {
-        SecretInfo {
-            kind,
-            ping_time,
-            secret,
-        }
-    }
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<Location>,
+    secret: ShortString,
 }
 
 struct Challenge {
-    current: String,
-    prev: String,
+    current: ShortString,
+    prev: ShortString,
 }
 
 impl Challenge {
     fn is_valid(&self, challenge: &str) -> bool {
-        challenge == self.current || challenge == self.prev
+        challenge == &self.current || challenge == &self.prev
     }
     fn current(&self) -> &str {
         &self.current
@@ -232,83 +243,86 @@ impl Challenger {
     fn reseed(&mut self) {
         self.prev_seed = mem::replace(&mut self.seed, random());
     }
-    fn for_address(&self, addr: &Url) -> Challenge {
-        fn hash(seed: &[u8], addr: &Url) -> String {
+    fn for_addr(&self, addr: &Addr) -> Challenge {
+        fn hash(seed: &[u8], addr: &[u8]) -> ShortString {
             let mut hash = SecureHash::new();
-            hash.update(addr.as_str().as_bytes());
+            hash.update(addr);
             hash.update(seed);
-            base64::encode(&hash.finalize()[..16])
+            let mut buf = [0; 64];
+            let len = base64::encode_config_slice(&hash.finalize()[..16], base64::STANDARD, &mut buf);
+            ShortString::from(str::from_utf8(&buf[..len]).unwrap()).unwrap()
         }
+        let mut buf: ArrayVec<u8, 128> = ArrayVec::new();
+        write!(&mut buf, "{}", addr).unwrap();
         Challenge {
-            current: hash(&self.seed, addr),
-            prev: hash(&self.prev_seed, addr),
+            current: hash(&self.seed, &buf),
+            prev: hash(&self.prev_seed, &buf),
         }
     }
 }
 
 struct Shared<'a> {
     challenger: &'a Mutex<Challenger>,
+    locations: &'a Locations,
     servers: &'a Mutex<Servers>,
     socket: &'a Arc<tokio::net::UdpSocket>,
     timekeeper: Timekeeper,
 }
 
 impl<'a> Shared<'a> {
-    fn challenge_for_address(&self, addr: &Url) -> Challenge {
+    fn challenge_for_addr(&self, addr: &Addr) -> Challenge {
         self.challenger.lock().unwrap_or_else(|poison| poison.into_inner())
-            .for_address(addr)
+            .for_addr(addr)
     }
     fn lock_servers(&'a self) -> sync::MutexGuard<'a, Servers> {
         self.servers.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
-/// Maintains a mapping from server secrets to server info. 
+/// Maintains a mapping from server addresses to server info. 
 ///
-/// Also maintains a mapping from addresses to corresponding server secrets.
+/// Also maintains a mapping from addresses to corresponding server addresses.
 #[derive(Clone, Deserialize, Serialize)]
 struct Servers {
-    pub secrets: HashMap<Url, SecretInfo>,
-    pub servers: HashMap<String, Server>,
+    pub addresses: HashMap<Addr, AddrInfo>,
+    pub servers: HashMap<ShortString, Server>,
 }
 
 impl Servers {
     fn new() -> Servers {
         Servers {
-            secrets: HashMap::new(),
+            addresses: HashMap::new(),
             servers: HashMap::new(),
         }
     }
     fn add(
         &mut self,
-        source: EntryKind,
-        ping_time: Timestamp,
-        address: Url,
-        secret: String,
-        info_serial: Cow<'_, str>,
+        addr: Addr,
+        a_info: AddrInfo,
+        info_serial: i64,
         info: Cow<'_, json::value::RawValue>,
     ) {
-        let insert_address;
-        let s_info = SecretInfo::new(source, ping_time, secret.clone());
-        match self.secrets.entry(address.clone()) {
+        let insert_addr;
+        let secret = a_info.secret.clone();
+        match self.addresses.entry(addr) {
             hash_map::Entry::Vacant(v) => {
-                v.insert(s_info);
-                insert_address = true;
+                v.insert(a_info);
+                insert_addr = true;
             },
             hash_map::Entry::Occupied(mut o) => {
-                if source < o.get().kind {
+                if a_info.kind < o.get().kind {
                     // Don't replace masterserver entries with stuff from backcompat.
                     return;
                 }
-                if ping_time < o.get().ping_time {
+                if a_info.ping_time < o.get().ping_time {
                     // Don't replace address info with older one.
                     return;
                 }
-                let old = o.insert(s_info);
-                insert_address = old.secret != secret;
-                if insert_address {
+                let old = o.insert(a_info);
+                insert_addr = old.secret != secret;
+                if insert_addr {
                     let server = self.servers.get_mut(&old.secret).unwrap();
-                    server.addresses.retain(|a| a.as_str() != address.as_str());
+                    server.addresses.retain(|&a| a != addr);
                     if server.addresses.is_empty() {
                         assert!(self.servers.remove(&old.secret).is_some());
                     }
@@ -317,21 +331,21 @@ impl Servers {
         }
         match self.servers.entry(secret) {
             hash_map::Entry::Vacant(v) => {
-                assert!(insert_address);
+                assert!(insert_addr);
                 v.insert(Server {
-                    addresses: vec![address],
-                    info_serial: info_serial.into_owned(),
+                    addresses: vec![addr],
+                    info_serial,
                     info: info.into_owned(),
                 });
             },
             hash_map::Entry::Occupied(mut o) => {
                 let mut server = &mut o.get_mut();
-                if insert_address {
-                    server.addresses.push(address);
+                if insert_addr {
+                    server.addresses.push(addr);
                     server.addresses.sort_unstable();
                 }
-                if &*info_serial > &*server.info_serial {
-                    server.info_serial = info_serial.into_owned();
+                if info_serial > server.info_serial {
+                    server.info_serial = info_serial;
                     server.info = info.into_owned();
                 }
             },
@@ -339,30 +353,27 @@ impl Servers {
     }
     fn prune_before(&mut self, time: Timestamp) {
         let mut remove = Vec::new();
-        for (address, s_info) in self.secrets.iter() {
-            if s_info.ping_time < time {
-                remove.push(address.clone());
+        for (&addr, a_info) in &self.addresses {
+            if a_info.ping_time < time {
+                remove.push(addr);
             }
         }
-        for address in remove {
-            let secret = self.secrets.remove(&address).unwrap().secret;
+        for addr in remove {
+            let secret = self.addresses.remove(&addr).unwrap().secret;
             let server = self.servers.get_mut(&secret).unwrap();
-            server.addresses.retain(|a| a.as_str() != address.as_str());
+            server.addresses.retain(|&a| a != addr);
             if server.addresses.is_empty() {
                 assert!(self.servers.remove(&secret).is_some());
             }
         }
     }
     fn merge(&mut self, other: &Dump) {
-        for (address, s_info) in other.secrets.iter() {
-            let server = &other.servers[&*s_info.secret];
-            // TODO: use cow
+        for (&addr, a_info) in &*other.addresses {
+            let server = &other.servers[&*a_info.secret];
             self.add(
-                s_info.kind,
-                s_info.ping_time,
-                address.clone(),
-                s_info.secret.clone(),
-                server.info_serial.clone(),
+                addr,
+                a_info.clone(),
+                server.info_serial,
                 Cow::Borrowed(&server.info),
             );
         }
@@ -371,8 +382,8 @@ impl Servers {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Server {
-    pub addresses: Vec<Url>,
-    pub info_serial: String,
+    pub addresses: Vec<Addr>,
+    pub info_serial: i64,
     pub info: Box<json::value::RawValue>,
 }
 
@@ -466,18 +477,18 @@ async fn handle_periodic_writeout(
                 None => Vec::new(),
             };
             if let Some((filename, filename_temp)) = &addresses_filename {
-                let mut non_backcompat_addresses = Vec::new();
-                non_backcompat_addresses.extend(servers.secrets.keys());
+                let mut non_backcompat_addrs: Vec<Addr> = Vec::new();
+                non_backcompat_addrs.extend(servers.addresses.keys());
                 let oldest = now.minus_seconds(30);
                 for other_dump in &other_dumps {
-                    non_backcompat_addresses.extend(other_dump.secrets.iter()
-                        .filter(|(_, s_info)| s_info.kind != EntryKind::Backcompat && s_info.ping_time >= oldest)
+                    non_backcompat_addrs.extend(other_dump.addresses.iter()
+                        .filter(|(_, a_info)| a_info.kind != EntryKind::Backcompat && a_info.ping_time >= oldest)
                         .map(|(addr, _)| addr)
                     );
                 }
-                non_backcompat_addresses.sort_unstable();
-                non_backcompat_addresses.dedup();
-                let json = json::to_string(&non_backcompat_addresses).unwrap();
+                non_backcompat_addrs.sort_unstable();
+                non_backcompat_addrs.dedup();
+                let json = json::to_string(&non_backcompat_addrs).unwrap();
                 overwrite_atomically(filename, filename_temp, json.as_bytes()).await.unwrap();
             }
             for other_dump in &other_dumps {
@@ -487,7 +498,15 @@ async fn handle_periodic_writeout(
             let json = {
                 let mut serialized = SerializedServers::new();
                 servers.prune_before(now.minus_seconds(30));
-                serialized.servers.extend(servers.servers.values().map(From::from));
+                serialized.servers.extend(servers.servers.values().map(|s| {
+                    // Get the location of the first registered address. Since
+                    // the addresses are kept sorted, this is stable.
+                    let location = s.addresses
+                        .iter()
+                        .filter_map(|addr| servers.addresses[addr].location)
+                        .next();
+                    SerializedServer::new(s, location)
+                }));
                 serialized.servers.sort_by_key(|s| s.addresses);
                 json::to_string(&serialized).unwrap()
             };
@@ -516,9 +535,9 @@ async fn send_challenge(
     connless_request_token_7: Option<[u8; 4]>,
     socket: Arc<tokio::net::UdpSocket>,
     target: SocketAddr,
-    secret: String,
-    addr: Url,
-    challenge: String,
+    secret: ShortString,
+    addr: Addr,
+    challenge: ShortString,
 ) {
     let mut packet = Vec::with_capacity(128);
     if let Some(t) = connless_request_token_7 {
@@ -530,7 +549,7 @@ async fn send_challenge(
     }
     packet.extend_from_slice(secret.as_bytes());
     packet.push(0);
-    packet.extend_from_slice(addr.as_str().as_bytes());
+    write!(&mut packet, "{}", addr).unwrap();
     packet.push(0);
     packet.extend_from_slice(challenge.as_bytes());
     packet.push(0);
@@ -539,21 +558,23 @@ async fn send_challenge(
 
 fn handle_register(
     shared: Shared,
-    remote_address: IpAddr,
-    register: &Register,
+    remote_addr: IpAddr,
+    register: Register,
 ) -> Result<RegisterResponse, RegisterError> {
-    let connless_request_token_7 = match register.address.scheme() {
-        "tw-0.5+udp" => None,
-        "tw-0.6+udp" => None,
-        "tw-0.7+udp" => {
+    let protocol: Protocol = register.address.scheme().parse()
+        .map_err(|_| "register address must start with one of tw-0.5+udp://, tw-0.6+udp://, tw-0.7+udp://")?;
+
+    let connless_request_token_7 = match protocol {
+        Protocol::V5 => None,
+        Protocol::V6 => None,
+        Protocol::V7 => {
             let token_hex = register.connless_request_token.as_ref().ok_or_else(|| {
                 "registering with tw-0.7+udp:// requires field \"connless_request_token\""
             })?;
             let mut token = [0; 4];
-            hex::decode_to_slice(token_hex, &mut token).map_err(|e| RegisterError::new(format!("invalid hex in connless_request_token: {}", e)))?;
+            hex::decode_to_slice(token_hex.as_bytes(), &mut token).map_err(|e| RegisterError::new(format!("invalid hex in connless_request_token: {}", e)))?;
             Some(token)
         },
-        _ => return Err("register address must start with one of tw-0.5+udp://, tw-0.6+udp://, tw-0.7+udp://".into()),
     };
     if register.address.host_str() != Some("connecting-address.invalid") {
         return Err("register address must have domain connecting-address.invalid".into());
@@ -564,9 +585,8 @@ fn handle_register(
         return Err("register address must specify port".into());
     };
 
-    let mut address = register.address.clone();
-    address.set_ip_host(remote_address).unwrap();
-    let challenge = shared.challenge_for_address(&address);
+    let addr = Addr { ip: remote_addr, port, protocol };
+    let challenge = shared.challenge_for_addr(&addr);
 
     let correct_challenge = register.challenge_token.as_ref()
         .map(|ct| challenge.is_valid(ct))
@@ -575,7 +595,7 @@ fn handle_register(
         .map(|ct| ct != challenge.current())
         .unwrap_or(true);
 
-    let common = RegisterResponseCommon { address: address.clone() };
+    let common = RegisterResponseCommon { address: addr };
     let result = if correct_challenge {
         let info = register.info.as_object().ok_or("register info must be an object")?;
 
@@ -584,11 +604,14 @@ fn handle_register(
         let raw_info = json::value::RawValue::from_string(raw_info).unwrap();
 
         shared.lock_servers().add(
-            EntryKind::Mastersrv,
-            shared.timekeeper.now(),
-            address.clone(),
-            register.secret.clone(),
-            Cow::Borrowed(&register.info_serial),
+            addr,
+            AddrInfo {
+                kind: EntryKind::Mastersrv,
+                ping_time: shared.timekeeper.now(),
+                location: shared.locations.lookup(addr.ip),
+                secret: register.secret.clone(),
+            },
+            register.info_serial,
             Cow::Owned(raw_info),
         );
 
@@ -598,13 +621,13 @@ fn handle_register(
     };
 
     if should_send_challenge {
-        println!("sending challenge to {}", address);
+        println!("sending challenge to {}", addr);
         tokio::spawn(send_challenge(
             connless_request_token_7,
             shared.socket.clone(),
-            SocketAddr::new(remote_address, port),
-            register.secret.clone(),
-            address,
+            SocketAddr::new(remote_addr, port),
+            register.secret,
+            addr,
             challenge.current,
         ));
     }
@@ -617,6 +640,7 @@ struct AssertUnwindSafe<T>(pub T);
 impl<T> panic::UnwindSafe for AssertUnwindSafe<T> {}
 impl<T> panic::RefUnwindSafe for AssertUnwindSafe<T> {}
 
+// TODO: put active part masterservers on a different domain?
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -639,7 +663,12 @@ async fn main() {
         .arg(Arg::new("connecting-ip-header")
             .long("connecting-ip-header")
             .value_name("HEADER")
-            .help("HTTP header to use to determine the client IP address")
+            .help("HTTP header to use to determine the client IP address.")
+        )
+        .arg(Arg::new("locations")
+            .long("locations")
+            .value_name("LOCATIONS")
+            .help("IP to continent locations database filename (CSV file with network,continent_code header).")
         )
         .arg(Arg::new("write-addresses")
             .long("write-addresses")
@@ -670,10 +699,16 @@ async fn main() {
     let listen_unix = matches.value_of("listen-unix");
 
     let challenger = Arc::new(Mutex::new(Challenger::new()));
+    let locations = Arc::new(matches.value_of("locations")
+        .map(|l| Locations::read(Path::new(&l)))
+        .transpose()
+        .unwrap()
+        .unwrap_or_else(Locations::empty));
     let servers = Arc::new(Mutex::new(Servers::new()));
     let socket = Arc::new(tokio::net::UdpSocket::bind("[::]:0").await.unwrap());
     let socket = AssertUnwindSafe(socket);
     let timekeeper = Timekeeper::new();
+
     tokio::spawn(handle_periodic_reseed(challenger.clone()));
     tokio::spawn(handle_periodic_writeout(
         servers.clone(),
@@ -690,11 +725,13 @@ async fn main() {
         .and(warp::path!("ddnet"/"15"/"register"))
         .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
+        .and(warp::body::content_length_limit(16 * 1024)) // limit body size to 16 KiB
         .and(warp::body::json())
         .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, register: Register| {
             let (http_status, body) = match panic::catch_unwind(|| {
                 let shared = Shared {
                     challenger: &challenger,
+                    locations: &locations,
                     servers: &servers,
                     socket: &socket.0,
                     timekeeper: timekeeper,
@@ -718,7 +755,7 @@ async fn main() {
                         }
                     }
                 }
-                handle_register(shared, addr, &register)
+                handle_register(shared, addr, register)
             }) {
                 Ok(Ok(r)) => (warp::http::StatusCode::OK, r),
                 Ok(Err(e)) => (warp::http::StatusCode::BAD_REQUEST, RegisterResponse::Error(e)),

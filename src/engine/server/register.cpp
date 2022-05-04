@@ -279,12 +279,6 @@ void CRegister::CProtocol::SendRegister()
 	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true; // NOLINT(readability-simplify-boolean-expr)
 	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 
-	char aInfoSerial[16];
-	// Make sure the info serial sorts alphabetically. Start with a0 to a9,
-	// continue with b10 to b99, c100 to c999 and so on.
-	str_format(aInfoSerial + 1, sizeof(aInfoSerial) - 1, "%d", InfoSerial);
-	aInfoSerial[0] = 'a' + str_length(aInfoSerial + 1) - 1;
-
 	const char *pRequestTokenJson = "";
 	if(m_Protocol == PROTOCOL_TW7_IPV6 || m_Protocol == PROTOCOL_TW7_IPV4)
 	{
@@ -299,7 +293,7 @@ void CRegister::CProtocol::SendRegister()
 		"\"secret\":\"%s\","
 		"%s" // request token
 		"%s" // challenge token
-		"\"info_serial\":\"%s\""
+		"\"info_serial\":%d"
 		"%s%s" // info
 		"%s}",
 		ProtocolToScheme(m_Protocol),
@@ -307,7 +301,7 @@ void CRegister::CProtocol::SendRegister()
 		aSecret,
 		pRequestTokenJson,
 		m_aChallengeTokenJson,
-		aInfoSerial,
+		InfoSerial,
 		SendInfo ? ",\"info\":" : "",
 		SendInfo ? m_pParent->m_aServerInfo : "",
 		m_pParent->m_aRegisterExtra);
