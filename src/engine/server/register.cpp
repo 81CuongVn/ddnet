@@ -276,7 +276,7 @@ void CRegister::CProtocol::SendRegister()
 
 	lock_wait(m_pShared->m_pGlobal->m_Lock);
 	int InfoSerial = m_pShared->m_pGlobal->m_InfoSerial;
-	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true;
+	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true; // NOLINT(readability-simplify-boolean-expr)
 	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 
 	char aInfoSerial[16];
@@ -357,7 +357,6 @@ void CRegister::CProtocol::Update()
 
 void CRegister::CProtocol::OnToken(const char *pToken)
 {
-	log_trace(ProtocolToSystem(m_Protocol), "got token: %s", pToken);
 	m_NewChallengeToken = true;
 	char aToken[64];
 	str_format(m_aChallengeTokenJson, sizeof(m_aChallengeTokenJson), "\"challenge_token\":\"%s\",", EscapeJson(aToken, sizeof(aToken), pToken));
@@ -554,11 +553,9 @@ bool CRegister::OnPacket(CNetChunk *pPacket)
 	{
 		return false;
 	}
-	log_trace("register", "packet size=%d", pPacket->m_DataSize);
 	if(pPacket->m_DataSize >= (int)sizeof(m_aVerifyPacket) &&
 		mem_comp(pPacket->m_pData, m_aVerifyPacket, sizeof(m_aVerifyPacket)) == 0)
 	{
-		log_trace("register", "correct prefix");
 		CUnpacker Unpacker;
 		Unpacker.Reset(pPacket->m_pData, pPacket->m_DataSize);
 		Unpacker.GetRaw(sizeof(m_aVerifyPacket));
@@ -566,15 +563,17 @@ bool CRegister::OnPacket(CNetChunk *pPacket)
 		const char *pToken = Unpacker.GetString(0);
 		if(Unpacker.Error())
 		{
-			return false;
+			log_error("register", "got errorneous challenge packet from master");
+			return true;
 		}
 
+		log_debug("register", "got challenge token, addr='%s' token='%s'", pAddressUrl, pToken);
 		int Protocol;
 		if(ProtocolFromUrl(&Protocol, pAddressUrl))
 		{
 			log_error("register", "got challenge packet with unknown protocol");
+			return true;
 		}
-		log_trace("register", "addr=%s token='%s'", pAddressUrl, pToken);
 		m_aProtocols[Protocol].OnToken(pToken);
 		return true;
 	}
