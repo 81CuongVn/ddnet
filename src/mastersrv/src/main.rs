@@ -720,8 +720,8 @@ async fn main() {
     let socket = AssertUnwindSafe(socket);
     let timekeeper = Timekeeper::new();
 
-    tokio::spawn(handle_periodic_reseed(challenger.clone()));
-    tokio::spawn(handle_periodic_writeout(
+    let task_reseed = tokio::spawn(handle_periodic_reseed(challenger.clone()));
+    let task_writeout = tokio::spawn(handle_periodic_writeout(
         servers.clone(),
         matches.value_of("read-dump-dir").map(|s| s.to_owned()),
         matches.value_of("write-dump").map(|s| s.to_owned()),
@@ -780,14 +780,14 @@ async fn main() {
         });
     let server = warp::serve(register);
 
-    if let Some(path) = listen_unix {
+    let task_server = if let Some(path) = listen_unix {
         #[cfg(unix)]
         {
             use tokio::net::UnixListener;
             use tokio_stream::wrappers::UnixListenerStream;
             let _ = fs::remove_file(path).await;
             let unix_socket = UnixListener::bind(path).unwrap();
-            server.run_incoming(UnixListenerStream::new(unix_socket)).await
+            tokio::spawn(server.run_incoming(UnixListenerStream::new(unix_socket)))
         }
         #[cfg(not(unix))]
         {
@@ -795,6 +795,11 @@ async fn main() {
             unreachable!();
         }
     } else {
-        server.run(listen_address).await
+        tokio::spawn(server.run(listen_address))
+    };
+
+    match tokio::try_join!(task_reseed, task_writeout, task_server) {
+        Ok(((), (), ())) => unreachable!(),
+        Err(e) => panic::resume_unwind(e.into_panic()),
     }
 }
