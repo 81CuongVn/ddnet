@@ -102,11 +102,15 @@ impl FromStr for Addr {
     fn from_str(s: &str) -> Result<Addr, InvalidAddr> {
         let url = Url::parse(s).map_err(|_| InvalidAddr)?;
         let protocol: Protocol = url.scheme().parse().map_err(|_| InvalidAddr)?;
-        let ip: IpAddr = url.host_str().ok_or(InvalidAddr)?.parse().map_err(|_| InvalidAddr)?;
-        let port = url.port().ok_or(InvalidAddr)?;
+        let mut ip_port: ArrayString<64> = ArrayString::new();
+        write!(&mut ip_port, "{}:{}",
+            url.host_str().ok_or(InvalidAddr)?,
+            url.port().ok_or(InvalidAddr)?
+        ).unwrap();
+        let sock_addr: SocketAddr = ip_port.parse().map_err(|_| InvalidAddr)?;
         Ok(Addr {
-            ip,
-            port,
+            ip: sock_addr.ip(),
+            port: sock_addr.port(),
             protocol,
         })
     }
@@ -155,6 +159,11 @@ mod test {
     fn addr_from_str() {
         assert_eq!(Addr::from_str("tw-0.6+udp://127.0.0.1:8303").unwrap(), Addr {
             ip: IpAddr::from_str("127.0.0.1").unwrap(),
+            port: 8303,
+            protocol: Protocol::V6,
+        });
+        assert_eq!(Addr::from_str("tw-0.6+udp://[::1]:8303").unwrap(), Addr {
+            ip: IpAddr::from_str("::1").unwrap(),
             port: 8303,
             protocol: Protocol::V6,
         });
