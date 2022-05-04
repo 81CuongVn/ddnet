@@ -30,9 +30,7 @@ use std::time::SystemTime;
 use tokio::fs::File;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::net::UnixListener;
 use tokio::time;
-use tokio_stream::wrappers::UnixListenerStream;
 use url::Url;
 use warp::Filter;
 
@@ -645,20 +643,13 @@ impl<T> panic::RefUnwindSafe for AssertUnwindSafe<T> {}
 async fn main() {
     env_logger::init();
 
-    let matches = Command::new("mastersrv")
+    let mut command = Command::new("mastersrv")
         .about("Collects game server info via an HTTP endpoint and aggregates them.")
         .arg(Arg::new("listen")
             .long("listen")
             .value_name("ADDRESS")
             .default_value("[::]:8080")
             .help("Listen address for the HTTP endpoint.")
-        )
-        .arg(Arg::new("listen-unix")
-            .long("listen-unix")
-            .value_name("PATH")
-            .requires("connecting-ip-header")
-            .conflicts_with("listen")
-            .help("Listen on the specified Unix domain socket.")
         )
         .arg(Arg::new("connecting-ip-header")
             .long("connecting-ip-header")
@@ -691,12 +682,24 @@ async fn main() {
             .value_name("OUT")
             .default_value("servers.json")
             .help("Output file for the aggregated server list in a DDNet 15.5+ compatible format.")
-        )
-        .get_matches();
+        );
+
+    if cfg!(unix) {
+        command = command
+            .arg(Arg::new("listen-unix")
+                .long("listen-unix")
+                .value_name("PATH")
+                .requires("connecting-ip-header")
+                .conflicts_with("listen")
+                .help("Listen on the specified Unix domain socket.")
+            );
+    }
+
+    let matches = command.get_matches();
 
     let listen_address: SocketAddr = matches.value_of_t_or_exit("listen");
     let connecting_ip_header = matches.value_of("connecting-ip-header").map(|s| s.to_owned());
-    let listen_unix = matches.value_of("listen-unix");
+    let listen_unix = if cfg!(unix) { matches.value_of("listen-unix") } else { None };
 
     let challenger = Arc::new(Mutex::new(Challenger::new()));
     let locations = Arc::new(matches.value_of("locations")
@@ -767,9 +770,21 @@ async fn main() {
                 .body(json::to_string(&body).unwrap())
         });
     let server = warp::serve(register);
+
     if let Some(path) = listen_unix {
-        let _ = fs::remove_file(path).await;
-        server.run_incoming(UnixListenerStream::new(UnixListener::bind(path).unwrap())).await
+        #[cfg(unix)]
+        {
+            use tokio::net::UnixListener;
+            use tokio_stream::wrappers::UnixListenerStream;
+            let _ = fs::remove_file(path).await;
+            let unix_socket = UnixListener::bind(path).unwrap();
+            server.run_incoming(UnixListenerStream::new(unix_socket)).await
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            unreachable!();
+        }
     } else {
         server.run(listen_address).await
     }

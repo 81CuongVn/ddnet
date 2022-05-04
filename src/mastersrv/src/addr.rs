@@ -28,6 +28,7 @@ impl fmt::Display for Protocol {
     }
 }
 
+#[derive(Debug)]
 pub struct UnknownProtocol;
 
 impl FromStr for Protocol {
@@ -93,6 +94,24 @@ impl fmt::Display for Addr {
     }
 }
 
+#[derive(Debug)]
+pub struct InvalidAddr;
+
+impl FromStr for Addr {
+    type Err = InvalidAddr;
+    fn from_str(s: &str) -> Result<Addr, InvalidAddr> {
+        let url = Url::parse(s).map_err(|_| InvalidAddr)?;
+        let protocol: Protocol = url.scheme().parse().map_err(|_| InvalidAddr)?;
+        let ip: IpAddr = url.host_str().ok_or(InvalidAddr)?.parse().map_err(|_| InvalidAddr)?;
+        let port = url.port().ok_or(InvalidAddr)?;
+        Ok(Addr {
+            ip,
+            port,
+            protocol,
+        })
+    }
+}
+
 impl serde::Serialize for Addr {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where S: serde::Serializer,
@@ -112,22 +131,8 @@ impl<'de> serde::de::Visitor<'de> for AddrVisitor {
         f.write_str("a URL like tw-0.6+udp://127.0.0.1:8303")
     }
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Addr, E> {
-        use url::Host::*;
         let invalid_value = || E::invalid_value(serde::de::Unexpected::Str(v), &self);
-        let url = Url::parse(v).map_err(|_| invalid_value())?;
-        let protocol: Protocol = url.scheme().parse().map_err(|_| invalid_value())?;
-        let ip = match url.host() {
-            Some(Domain(_)) => return Err(invalid_value()),
-            Some(Ipv4(ip)) => ip.into(),
-            Some(Ipv6(ip)) => ip.into(),
-            None => return Err(invalid_value()),
-        };
-        let port = url.port().ok_or_else(invalid_value)?;
-        Ok(Addr {
-            ip,
-            port,
-            protocol,
-        })
+        Ok(Addr::from_str(v).map_err(|_| invalid_value())?)
     }
 }
 
@@ -139,3 +144,19 @@ impl<'de> serde::Deserialize<'de> for Addr {
     }
 }
 
+#[cfg(test)]
+mod test {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+    use super::Addr;
+    use super::Protocol;
+
+    #[test]
+    fn addr_from_str() {
+        assert_eq!(Addr::from_str("tw-0.6+udp://127.0.0.1:8303").unwrap(), Addr {
+            ip: IpAddr::from_str("127.0.0.1").unwrap(),
+            port: 8303,
+            protocol: Protocol::V6,
+        });
+    }
+}
