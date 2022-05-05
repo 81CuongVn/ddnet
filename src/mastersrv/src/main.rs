@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map;
 use std::ffi::OsStr;
+use std::fmt;
 use std::io::Write;
 use std::io;
 use std::mem;
@@ -641,6 +642,44 @@ fn handle_register(
     Ok(result)
 }
 
+fn register_from_headers(headers: &warp::http::HeaderMap, info: json::Value)
+    -> Result<Register, RegisterError>
+{
+    if !headers.contains_key("address") {
+        // backward compatibility already, lol
+        let json = json::to_string(&info).unwrap();
+        return json::from_str(&json)
+            .map_err(|e| RegisterError::new(format!("invalid register object: {}", e)));
+    }
+    fn parse_opt<T: str::FromStr>(headers: &warp::http::HeaderMap, name: &str)
+        -> Result<Option<T>, RegisterError>
+        where T::Err: fmt::Display,
+    {
+        headers.get(name).map(|v| -> Result<T, RegisterError> {
+            v
+                .to_str()
+                .map_err(|e| RegisterError::new(format!("invalid header {}: {}", name, e)))?
+                .parse()
+                .map_err(|e| RegisterError::new(format!("invalid header {}: {}", name, e)))
+        }).transpose()
+    }
+    fn parse<T: str::FromStr>(headers: &warp::http::HeaderMap, name: &str)
+        -> Result<T, RegisterError>
+        where T::Err: fmt::Display,
+    {
+        parse_opt(headers, name)?
+            .ok_or_else(|| RegisterError::new(format!("missing required header {}", name)))
+    }
+    Ok(Register {
+        address: parse(headers, "Address")?,
+        secret: parse(headers, "Secret")?,
+        connless_request_token: parse_opt(headers, "Connless-Request-Token")?,
+        challenge_token: parse_opt(headers, "Challenge-Token")?,
+        info_serial: parse(headers, "Info-Serial")?,
+        info,
+    })
+}
+
 #[derive(Clone)]
 struct AssertUnwindSafe<T>(pub T);
 impl<T> panic::UnwindSafe for AssertUnwindSafe<T> {}
@@ -738,8 +777,9 @@ async fn main() {
         .and(warp::addr::remote())
         .and(warp::body::content_length_limit(16 * 1024)) // limit body size to 16 KiB
         .and(warp::body::json())
-        .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, register: Register| {
+        .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, info: json::Value| {
             let (http_status, body) = match panic::catch_unwind(|| {
+                let register = register_from_headers(&headers, info)?;
                 let shared = Shared {
                     challenger: &challenger,
                     locations: &locations,

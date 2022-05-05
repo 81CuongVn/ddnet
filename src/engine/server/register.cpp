@@ -97,7 +97,8 @@ class CRegister : public IRegister
 		std::shared_ptr<CShared> m_pShared;
 		int m_NumTotalRequests = 0;
 		bool m_NewChallengeToken = false;
-		char m_aChallengeTokenJson[128] = {0};
+		bool m_HaveChallengeToken = false;
+		char m_aChallengeToken[128] = {0};
 
 		void CheckChallengeStatus();
 
@@ -115,7 +116,7 @@ class CRegister : public IRegister
 	IConsole *m_pConsole;
 	IEngine *m_pEngine;
 	int m_ServerPort;
-	char m_aConnlessRequestTokenJson[64];
+	char m_aConnlessRequestTokenHex[16];
 
 	std::shared_ptr<CGlobal> m_pGlobal = std::make_shared<CGlobal>();
 	bool m_aProtocolEnabled[NUM_PROTOCOLS] = {true, true, true, true};
@@ -272,6 +273,9 @@ void CRegister::CProtocol::SendRegister()
 	int64_t Now = time_get();
 	int64_t Freq = time_freq();
 
+	char aAddress[64];
+	str_format(aAddress, sizeof(aAddress), "%sconnecting-address.invalid:%d", ProtocolToScheme(m_Protocol), m_pParent->m_ServerPort);
+
 	char aSecret[UUID_MAXSTRSIZE];
 	FormatUuid(m_pParent->m_Secret, aSecret, sizeof(aSecret));
 
@@ -280,34 +284,27 @@ void CRegister::CProtocol::SendRegister()
 	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true; // NOLINT(readability-simplify-boolean-expr)
 	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 
-	const char *pRequestTokenJson = "";
+	// TODO: Don't send info if the master already knows it.
+	std::unique_ptr<CHttpRequest> pRegister;
+	if(SendInfo)
+	{
+		pRegister = HttpPostJson(m_pParent->m_pConfig->m_SvRegisterUrl, m_pParent->m_aServerInfo);
+	}
+	else
+	{
+		pRegister = HttpPost(m_pParent->m_pConfig->m_SvRegisterUrl, (unsigned char *)"", 0);
+	}
+	pRegister->HeaderString("Address", aAddress);
+	pRegister->HeaderString("Secret", aSecret);
 	if(m_Protocol == PROTOCOL_TW7_IPV6 || m_Protocol == PROTOCOL_TW7_IPV4)
 	{
-		pRequestTokenJson = m_pParent->m_aConnlessRequestTokenJson;
+		pRegister->HeaderString("Connless-Request-Token", m_pParent->m_aConnlessRequestTokenHex);
 	}
-
-	// TODO: Don't send info if the master already knows it.
-	char aJson[4096];
-	str_format(aJson, sizeof(aJson),
-		"{"
-		"\"address\":\"%sconnecting-address.invalid:%d\","
-		"\"secret\":\"%s\","
-		"%s" // request token
-		"%s" // challenge token
-		"\"info_serial\":%d"
-		"%s%s" // info
-		"%s}",
-		ProtocolToScheme(m_Protocol),
-		m_pParent->m_ServerPort,
-		aSecret,
-		pRequestTokenJson,
-		m_aChallengeTokenJson,
-		InfoSerial,
-		SendInfo ? ",\"info\":" : "",
-		SendInfo ? m_pParent->m_aServerInfo : "",
-		m_pParent->m_aRegisterExtra);
-
-	std::unique_ptr<CHttpRequest> pRegister = HttpPostJson(m_pParent->m_pConfig->m_SvRegisterUrl, aJson);
+	if(m_HaveChallengeToken)
+	{
+		pRegister->HeaderString("Challenge-Token", m_aChallengeToken);
+	}
+	pRegister->HeaderInt("Info-Serial", InfoSerial);
 	pRegister->LogProgress(HTTPLOG::FAILURE);
 	pRegister->IpResolve(ProtocolToIpresolve(m_Protocol));
 
@@ -364,8 +361,8 @@ void CRegister::CProtocol::Update()
 void CRegister::CProtocol::OnToken(const char *pToken)
 {
 	m_NewChallengeToken = true;
-	char aToken[64];
-	str_format(m_aChallengeTokenJson, sizeof(m_aChallengeTokenJson), "\"challenge_token\":\"%s\",", EscapeJson(aToken, sizeof(aToken), pToken));
+	m_HaveChallengeToken = true;
+	str_copy(m_aChallengeToken, pToken, sizeof(m_aChallengeToken));
 
 	CheckChallengeStatus();
 	if(time_get() >= m_NextRegister)
@@ -448,9 +445,7 @@ CRegister::CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int
 	// The DDNet code uses the `unsigned` security token in memory byte order.
 	unsigned char TokenBytes[4];
 	mem_copy(TokenBytes, &SixupSecurityToken, sizeof(TokenBytes));
-	str_format(m_aConnlessRequestTokenJson, sizeof(m_aConnlessRequestTokenJson),
-		"\"connless_request_token\":\"%08x\",",
-		bytes_be_to_uint(TokenBytes));
+	str_format(m_aConnlessRequestTokenHex, sizeof(m_aConnlessRequestTokenHex), "%08x", bytes_be_to_uint(TokenBytes));
 
 	m_pConsole->Chain("sv_register", ConchainOnConfigChange, this);
 	m_pConsole->Chain("sv_sixup", ConchainOnConfigChange, this);
