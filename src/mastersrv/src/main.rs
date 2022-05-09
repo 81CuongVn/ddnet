@@ -53,9 +53,6 @@ const SERVER_TIMEOUT_SECONDS: u64 = 30;
 
 type ShortString = ArrayString<64>;
 
-// TODO: make it compile on Windows
-// TODO: perhaps make it restartable? the only thing missing from the dump is the secrets of the
-// challenger.
 // TODO: delete action for server shutdown
 
 #[derive(Debug, Deserialize)]
@@ -303,6 +300,8 @@ enum AddResult {
     Obsolete,
 }
 
+struct FromDumpError;
+
 impl Servers {
     fn new() -> Servers {
         Servers {
@@ -407,6 +406,30 @@ impl Servers {
             );
         }
     }
+    fn from_dump(dump: Dump) -> Result<Servers, FromDumpError> {
+        let mut result = Servers {
+            addresses: dump.addresses.into_iter().collect(),
+            servers: dump.servers.into_iter().map(|(secret, server)| {
+                (secret, Server {
+                    addresses: vec![],
+                    info_serial: server.info_serial,
+                    info: server.info.into_owned(),
+                })
+            }).collect(),
+        };
+        // Fix up addresses in `Server` struct -- they're not serialized into a
+        // `Dump`.
+        for (&addr, a_info) in &result.addresses {
+            result.servers.get_mut(&a_info.secret).ok_or(FromDumpError)?.addresses.push(addr);
+        }
+        for server in result.servers.values_mut() {
+            if server.addresses.is_empty() {
+                return Err(FromDumpError);
+            }
+            server.addresses.sort_unstable();
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -431,21 +454,25 @@ async fn handle_periodic_reseed(challenger: Arc<Mutex<Challenger>>) {
     }
 }
 
+async fn read_dump(path: &Path, timekeeper: Timekeeper) -> Result<Dump<'static>, io::Error> {
+    let mut buffer = Vec::new();
+    let timestamp = timekeeper.from_system_time(fs::metadata(&path).await?.modified().unwrap());
+    buffer.clear();
+    File::open(&path).await?.read_to_end(&mut buffer).await?;
+    let mut dump: Dump = json::from_slice(&buffer)?;
+    dump.fixup_timestamps(timestamp);
+    Ok(dump)
+}
+
 async fn read_dump_dir(path: &Path, timekeeper: Timekeeper) -> Vec<Dump<'static>> {
-    // TODO: unwrap
     let mut dir_entries = fs::read_dir(path).await.unwrap();
     let mut dumps = Vec::new();
-    let mut buffer = Vec::new();
     while let Some(entry) = dir_entries.next_entry().await.unwrap() {
         let path = entry.path();
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
-        let timestamp = timekeeper.from_system_time(fs::metadata(&path).await.unwrap().modified().unwrap());
-        buffer.clear();
-        File::open(&path).await.unwrap().read_to_end(&mut buffer).await.unwrap();
-        let mut dump: Dump = json::from_slice(&buffer).unwrap();
-        dump.fixup_timestamps(timestamp);
+        let dump = read_dump(&path, timekeeper).await.unwrap();
         dumps.push((path, dump));
     }
     dumps.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
@@ -785,6 +812,12 @@ async fn main() {
             .value_name("DUMP")
             .help("Dump the internal state to a JSON file each second.")
         )
+        .arg(Arg::new("read-write-dump")
+            .long("read-write-dump")
+            .value_name("DUMP")
+            .conflicts_with("write-dump")
+            .help("Dump the internal state to a JSON file each second, but also read it at the start.")
+        )
         .arg(Arg::new("read-dump-dir")
             .long("read-dump-dir")
             .takes_value(true)
@@ -814,23 +847,38 @@ async fn main() {
     let listen_address: SocketAddr = matches.value_of_t_or_exit("listen");
     let connecting_ip_header = matches.value_of("connecting-ip-header").map(|s| s.to_owned());
     let listen_unix = if cfg!(unix) { matches.value_of("listen-unix") } else { None };
+    let read_write_dump = matches.value_of("read-write-dump").map(|s| s.to_owned());
 
+    let timekeeper = Timekeeper::new();
     let challenger = Arc::new(Mutex::new(Challenger::new()));
     let locations = Arc::new(matches.value_of("locations")
         .map(|l| Locations::read(Path::new(&l)))
         .transpose()
         .unwrap()
         .unwrap_or_else(Locations::empty));
-    let servers = Arc::new(Mutex::new(Servers::new()));
+    let mut servers = Servers::new();
+    match &read_write_dump {
+        Some(path) => match read_dump(Path::new(&path), timekeeper).await {
+            Ok(dump) => match Servers::from_dump(dump) {
+                Ok(read_servers) => {
+                    info!("successfully read previous dump");
+                    servers = read_servers;
+                },
+                Err(FromDumpError) => error!("previous dump was inconsistent"),
+            }
+            Err(e) => error!("couldn't read previous dump: {}", e),
+        },
+        None => {},
+    }
+    let servers = Arc::new(Mutex::new(servers));
     let socket = Arc::new(tokio::net::UdpSocket::bind("[::]:0").await.unwrap());
     let socket = AssertUnwindSafe(socket);
-    let timekeeper = Timekeeper::new();
 
     let task_reseed = tokio::spawn(handle_periodic_reseed(challenger.clone()));
     let task_writeout = tokio::spawn(handle_periodic_writeout(
         servers.clone(),
         matches.value_of("read-dump-dir").map(|s| s.to_owned()),
-        matches.value_of("write-dump").map(|s| s.to_owned()),
+        matches.value_of("write-dump").map(|s| s.to_owned()).or(read_write_dump),
         matches.value_of("write-addresses").map(|s| s.to_owned()),
         matches.value_of("out").unwrap().to_owned(),
         timekeeper,
@@ -850,7 +898,7 @@ async fn main() {
                     locations: &locations,
                     servers: &servers,
                     socket: &socket.0,
-                    timekeeper: timekeeper,
+                    timekeeper,
                 };
                 let mut addr = if let Some(header) = &connecting_ip_header {
                     headers
