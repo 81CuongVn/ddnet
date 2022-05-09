@@ -2,6 +2,7 @@ use arrayvec::ArrayString;
 use arrayvec::ArrayVec;
 use clap::Arg;
 use clap::Command;
+use headers::HeaderMapExt as _;
 use rand::random;
 use serde::Deserialize;
 use serde::Serialize;
@@ -59,8 +60,8 @@ type ShortString = ArrayString<64>;
 struct Register {
     address: Url,
     secret: ShortString,
-    // TODO: naming, why is it called "request"_token?
     connless_request_token: Option<ShortString>,
+    challenge_secret: Option<ShortString>,
     challenge_token: Option<ShortString>,
     info_serial: i64,
     info: Option<json::Value>,
@@ -72,18 +73,44 @@ enum RegisterResponse {
     Success,
     NeedChallenge,
     NeedInfo,
-    Error(RegisterError)
+    Error(RegisterError),
 }
 
 #[derive(Debug, Serialize)]
 struct RegisterError {
+    #[serde(skip)]
+    is_unsupported_media_type: bool,
     message: Cow<'static, str>,
 }
 
 impl RegisterError {
     fn new(s: String) -> RegisterError {
         RegisterError {
+            is_unsupported_media_type: false,
             message: Cow::Owned(s),
+        }
+    }
+    fn unsupported_media_type() -> RegisterError {
+        RegisterError {
+            is_unsupported_media_type: true,
+            message: Cow::Borrowed("The request's Content-Type is not supported"),
+        }
+    }
+    fn status(&self) -> warp::http::StatusCode {
+        use warp::http::StatusCode;
+        if !self.is_unsupported_media_type {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        }
+    }
+}
+
+impl From<&'static str> for RegisterError {
+    fn from(s: &'static str) -> RegisterError {
+        RegisterError {
+            is_unsupported_media_type: false,
+            message: Cow::Borrowed(s),
         }
     }
 }
@@ -439,14 +466,6 @@ struct Server {
     pub info: Box<json::value::RawValue>,
 }
 
-impl From<&'static str> for RegisterError {
-    fn from(s: &'static str) -> RegisterError {
-        RegisterError {
-            message: Cow::Borrowed(s),
-        }
-    }
-}
-
 async fn handle_periodic_reseed(challenger: Arc<Mutex<Challenger>>) {
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -576,15 +595,11 @@ async fn handle_periodic_writeout(
     }
 }
 
-// TODO: Perhaps it would be better to use something other than the `secret` to
-// identify challenges because those can't be changed by the client without
-// creating different results.
 async fn send_challenge(
     connless_request_token_7: Option<[u8; 4]>,
     socket: Arc<tokio::net::UdpSocket>,
     target: SocketAddr,
-    secret: ShortString,
-    addr: Addr,
+    challenge_secret: ShortString,
     challenge: ShortString,
 ) {
     let mut packet = Vec::with_capacity(128);
@@ -595,9 +610,7 @@ async fn send_challenge(
     } else {
         packet.extend_from_slice(b"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xffchal");
     }
-    packet.extend_from_slice(secret.as_bytes());
-    packet.push(0);
-    write!(&mut packet, "{}", addr).unwrap();
+    packet.extend_from_slice(challenge_secret.as_bytes());
     packet.push(0);
     packet.extend_from_slice(challenge.as_bytes());
     packet.push(0);
@@ -617,7 +630,7 @@ fn handle_register(
         Protocol::V6 => None,
         Protocol::V7 => {
             let token_hex = register.connless_request_token.as_ref().ok_or_else(|| {
-                "registering with tw-0.7+udp:// requires header Connless-Request-Token"
+                "registering with tw-0.7+udp:// requires header Connless-Token"
             })?;
             let mut token = [0; 4];
             hex::decode_to_slice(token_hex.as_bytes(), &mut token).map_err(|e| RegisterError::new(format!("invalid hex in Connless-Request-Token: {}", e)))?;
@@ -680,16 +693,15 @@ fn handle_register(
 
     if should_send_challenge {
         if let RegisterResponse::Success = result {
-            debug!("re-sending challenge to {}", addr);
+            trace!("re-sending challenge to {}", addr);
         } else {
-            debug!("sending challenge to {}", addr);
+            trace!("sending challenge to {}", addr);
         }
         tokio::spawn(send_challenge(
             connless_request_token_7,
             shared.socket.clone(),
             SocketAddr::new(remote_addr, port),
-            register.secret,
-            addr,
+            register.challenge_secret.unwrap_or(register.secret),
             challenge.current,
         ));
     }
@@ -700,7 +712,6 @@ fn handle_register(
 fn register_from_headers(headers: &warp::http::HeaderMap, info: &[u8])
     -> Result<Register, RegisterError>
 {
-    // TODO: check content-type. what to do with multiple content-type headers?
     if !headers.contains_key("address") {
         // backward compatibility already, lol
         let json = json::to_string(&info).unwrap();
@@ -729,10 +740,14 @@ fn register_from_headers(headers: &warp::http::HeaderMap, info: &[u8])
     Ok(Register {
         address: parse(headers, "Address")?,
         secret: parse(headers, "Secret")?,
-        connless_request_token: parse_opt(headers, "Connless-Request-Token")?,
+        connless_request_token: parse_opt(headers, "Connless-Token")?,
+        challenge_secret: Some(parse(headers, "Challenge-Secret")?),
         challenge_token: parse_opt(headers, "Challenge-Token")?,
         info_serial: parse(headers, "Info-Serial")?,
         info: if !info.is_empty() {
+            if headers.typed_get() != Some(headers::ContentType::json()) {
+                return Err(RegisterError::unsupported_media_type());
+            }
             Some(json::from_slice(info)
                 .map_err(|e| RegisterError::new(format!("Request body deserialize error: {}", e)))?
             )
@@ -760,8 +775,6 @@ async fn recover(err: warp::Rejection) -> Result<impl warp::Reply, warp::Rejecti
         (e, StatusCode::LENGTH_REQUIRED)
     } else if let Some(e) = err.find::<warp::reject::PayloadTooLarge>() {
         (e, StatusCode::PAYLOAD_TOO_LARGE)
-    } else if let Some(e) = err.find::<warp::reject::UnsupportedMediaType>() {
-        (e, StatusCode::UNSUPPORTED_MEDIA_TYPE)
     } else {
         return Err(err);
     };
@@ -922,7 +935,7 @@ async fn main() {
                 handle_register(shared, addr, register)
             }) {
                 Ok(Ok(r)) => (warp::http::StatusCode::OK, r),
-                Ok(Err(e)) => (warp::http::StatusCode::BAD_REQUEST, RegisterResponse::Error(e)),
+                Ok(Err(e)) => (e.status(), RegisterResponse::Error(e)),
                 Err(_) => (warp::http::StatusCode::INTERNAL_SERVER_ERROR, RegisterResponse::Error("unexpected panic".into())),
             };
             warp::http::Response::builder()

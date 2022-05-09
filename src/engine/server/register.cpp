@@ -27,7 +27,6 @@ class CRegister : public IRegister
 	};
 
 	static bool StatusFromString(int *pResult, const char *pString);
-	static bool ProtocolFromUrl(int *pResult, const char *pUrl);
 	static const char *ProtocolToScheme(int Protocol);
 	static const char *ProtocolToString(int Protocol);
 	static bool ProtocolFromString(int *pResult, const char *pString);
@@ -116,16 +115,18 @@ class CRegister : public IRegister
 	IConsole *m_pConsole;
 	IEngine *m_pEngine;
 	int m_ServerPort;
-	char m_aConnlessRequestTokenHex[16];
+	char m_aConnlessTokenHex[16];
 
 	std::shared_ptr<CGlobal> m_pGlobal = std::make_shared<CGlobal>();
 	bool m_aProtocolEnabled[NUM_PROTOCOLS] = {true, true, true, true};
 	CProtocol m_aProtocols[NUM_PROTOCOLS];
 
-	char m_aRegisterExtra[256];
+	int m_NumExtraHeaders = 0;
+	char m_aaExtraHeaders[8][128];
 
-	char m_aVerifyPacket[sizeof(SERVERBROWSE_CHALLENGE) + UUID_MAXSTRSIZE];
+	char m_aVerifyPacketPrefix[sizeof(SERVERBROWSE_CHALLENGE) + UUID_MAXSTRSIZE];
 	CUuid m_Secret = RandomUuid();
+	CUuid m_ChallengeSecret = RandomUuid();
 	bool m_GotServerInfo = false;
 	char m_aServerInfo[16384];
 
@@ -133,7 +134,7 @@ public:
 	CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int ServerPort, unsigned SixupSecurityToken);
 	void Update() override;
 	void OnConfigChange() override;
-	bool OnPacket(CNetChunk *pPacket) override;
+	bool OnPacket(const CNetChunk *pPacket) override;
 	void OnNewInfo(const char *pInfo) override;
 };
 
@@ -150,32 +151,6 @@ bool CRegister::StatusFromString(int *pResult, const char *pString)
 	else if(str_comp(pString, "need_info") == 0)
 	{
 		*pResult = STATUS_NEEDINFO;
-	}
-	else
-	{
-		*pResult = -1;
-		return true;
-	}
-	return false;
-}
-
-bool CRegister::ProtocolFromUrl(int *pResult, const char *pUrl)
-{
-	// 1234567890123
-	// tw-0.6+udp://
-	if(str_length(pUrl) < 13)
-	{
-		*pResult = -1;
-		return true;
-	}
-	bool Ipv6 = pUrl[13] == '[';
-	if(str_startswith(pUrl, "tw-0.6+udp://"))
-	{
-		*pResult = Ipv6 ? PROTOCOL_TW6_IPV6 : PROTOCOL_TW6_IPV4;
-	}
-	else if(str_startswith(pUrl, "tw-0.7+udp://"))
-	{
-		*pResult = Ipv6 ? PROTOCOL_TW7_IPV6 : PROTOCOL_TW7_IPV4;
 	}
 	else
 	{
@@ -283,12 +258,16 @@ void CRegister::CProtocol::SendRegister()
 	char aSecret[UUID_MAXSTRSIZE];
 	FormatUuid(m_pParent->m_Secret, aSecret, sizeof(aSecret));
 
+	char aChallengeUuid[UUID_MAXSTRSIZE];
+	FormatUuid(m_pParent->m_ChallengeSecret, aChallengeUuid, sizeof(aChallengeUuid));
+	char aChallengeSecret[64];
+	str_format(aChallengeSecret, sizeof(aChallengeSecret), "%s:%s", aChallengeUuid, ProtocolToString(m_Protocol));
+
 	lock_wait(m_pShared->m_pGlobal->m_Lock);
 	int InfoSerial = m_pShared->m_pGlobal->m_InfoSerial;
 	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial;
 	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 
-	// TODO: Don't send info if the master already knows it.
 	std::unique_ptr<CHttpRequest> pRegister;
 	if(SendInfo)
 	{
@@ -302,13 +281,18 @@ void CRegister::CProtocol::SendRegister()
 	pRegister->HeaderString("Secret", aSecret);
 	if(m_Protocol == PROTOCOL_TW7_IPV6 || m_Protocol == PROTOCOL_TW7_IPV4)
 	{
-		pRegister->HeaderString("Connless-Request-Token", m_pParent->m_aConnlessRequestTokenHex);
+		pRegister->HeaderString("Connless-Token", m_pParent->m_aConnlessTokenHex);
 	}
+	pRegister->HeaderString("Challenge-Secret", aChallengeSecret);
 	if(m_HaveChallengeToken)
 	{
 		pRegister->HeaderString("Challenge-Token", m_aChallengeToken);
 	}
 	pRegister->HeaderInt("Info-Serial", InfoSerial);
+	for(int i = 0; i < m_pParent->m_NumExtraHeaders; i++)
+	{
+		pRegister->Header(m_pParent->m_aaExtraHeaders[i]);
+	}
 	pRegister->LogProgress(HTTPLOG::FAILURE);
 	pRegister->IpResolve(ProtocolToIpresolve(m_Protocol));
 
@@ -462,13 +446,14 @@ CRegister::CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int
 	}
 {
 	const int HEADER_LEN = sizeof(SERVERBROWSE_CHALLENGE);
-	mem_copy(m_aVerifyPacket, SERVERBROWSE_CHALLENGE, HEADER_LEN);
-	FormatUuid(m_Secret, m_aVerifyPacket + HEADER_LEN, sizeof(m_aVerifyPacket) - HEADER_LEN);
+	mem_copy(m_aVerifyPacketPrefix, SERVERBROWSE_CHALLENGE, HEADER_LEN);
+	FormatUuid(m_ChallengeSecret, m_aVerifyPacketPrefix + HEADER_LEN, sizeof(m_aVerifyPacketPrefix) - HEADER_LEN);
+	m_aVerifyPacketPrefix[HEADER_LEN + UUID_MAXSTRSIZE - 1] = ':';
 
 	// The DDNet code uses the `unsigned` security token in memory byte order.
 	unsigned char TokenBytes[4];
 	mem_copy(TokenBytes, &SixupSecurityToken, sizeof(TokenBytes));
-	str_format(m_aConnlessRequestTokenHex, sizeof(m_aConnlessRequestTokenHex), "%08x", bytes_be_to_uint(TokenBytes));
+	str_format(m_aConnlessTokenHex, sizeof(m_aConnlessTokenHex), "%08x", bytes_be_to_uint(TokenBytes));
 
 	m_pConsole->Chain("sv_register", ConchainOnConfigChange, this);
 	m_pConsole->Chain("sv_sixup", ConchainOnConfigChange, this);
@@ -553,40 +538,39 @@ void CRegister::OnConfigChange()
 		m_aProtocolEnabled[PROTOCOL_TW7_IPV6] = false;
 		m_aProtocolEnabled[PROTOCOL_TW7_IPV4] = false;
 	}
-	int RegisterExtraLength = str_length(m_pConfig->m_SvRegisterExtra);
-	json_value *pRegisterExtra = json_parse(m_pConfig->m_SvRegisterExtra, RegisterExtraLength);
-	bool Valid = pRegisterExtra && pRegisterExtra->type == json_object && m_pConfig->m_SvRegisterExtra[0] == '{' && m_pConfig->m_SvRegisterExtra[RegisterExtraLength - 1] == '}';
-	bool Empty = !Valid || pRegisterExtra->u.object.length == 0;
-	json_value_free(pRegisterExtra);
-	if(!Empty)
+	m_NumExtraHeaders = 0;
+	const char *pRegisterExtra = m_pConfig->m_SvRegisterExtra;
+	char aHeader[128];
+	while((pRegisterExtra = str_next_token(pRegisterExtra, ",", aHeader, sizeof(aHeader))))
 	{
-		str_copy(m_aRegisterExtra, m_pConfig->m_SvRegisterExtra, sizeof(m_aRegisterExtra));
-		m_aRegisterExtra[0] = ',';
-		m_aRegisterExtra[RegisterExtraLength - 1] = 0;
-	}
-	else
-	{
-		str_copy(m_aRegisterExtra, "", sizeof(m_aRegisterExtra));
-	}
-	if(!Valid)
-	{
-		log_error("register", "invalid sv_register_extra, not a JSON object or doesn't start/end with {}: '%s'", m_pConfig->m_SvRegisterExtra);
+		if(m_NumExtraHeaders == (int)std::size(m_aaExtraHeaders))
+		{
+			log_warn("register", "reached maximum of %d extra headers, dropping '%s' and all further headers", m_NumExtraHeaders, aHeader);
+			break;
+		}
+		if(!str_find(aHeader, ": "))
+		{
+			log_warn("register", "header '%s' doesn't contain mandatory ': ', ignoring", aHeader);
+			continue;
+		}
+		str_copy(m_aaExtraHeaders[m_NumExtraHeaders], aHeader, sizeof(m_aaExtraHeaders));
+		m_NumExtraHeaders += 1;
 	}
 }
 
-bool CRegister::OnPacket(CNetChunk *pPacket)
+bool CRegister::OnPacket(const CNetChunk *pPacket)
 {
 	if((pPacket->m_Flags & NETSENDFLAG_CONNLESS) == 0)
 	{
 		return false;
 	}
-	if(pPacket->m_DataSize >= (int)sizeof(m_aVerifyPacket) &&
-		mem_comp(pPacket->m_pData, m_aVerifyPacket, sizeof(m_aVerifyPacket)) == 0)
+	if(pPacket->m_DataSize >= (int)sizeof(m_aVerifyPacketPrefix) &&
+		mem_comp(pPacket->m_pData, m_aVerifyPacketPrefix, sizeof(m_aVerifyPacketPrefix)) == 0)
 	{
 		CUnpacker Unpacker;
 		Unpacker.Reset(pPacket->m_pData, pPacket->m_DataSize);
-		Unpacker.GetRaw(sizeof(m_aVerifyPacket));
-		const char *pAddressUrl = Unpacker.GetString(0);
+		Unpacker.GetRaw(sizeof(m_aVerifyPacketPrefix));
+		const char *pProtocol = Unpacker.GetString(0);
 		const char *pToken = Unpacker.GetString(0);
 		if(Unpacker.Error())
 		{
@@ -594,9 +578,9 @@ bool CRegister::OnPacket(CNetChunk *pPacket)
 			return true;
 		}
 
-		log_debug("register", "got challenge token, addr='%s' token='%s'", pAddressUrl, pToken);
+		log_debug("register", "got challenge token, protocol='%s' token='%s'", pProtocol, pToken);
 		int Protocol;
-		if(ProtocolFromUrl(&Protocol, pAddressUrl))
+		if(ProtocolFromString(&Protocol, pProtocol))
 		{
 			log_error("register", "got challenge packet with unknown protocol");
 			return true;

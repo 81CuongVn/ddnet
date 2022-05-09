@@ -17,7 +17,7 @@ public:
 	virtual void OnConfigChange() = 0;
 	// Returns `true` if the packet was a packet related to registering
 	// code and doesn't have to processed furtherly.
-	virtual bool OnPacket(CNetChunk *pPacket) = 0;
+	virtual bool OnPacket(const CNetChunk *pPacket) = 0;
 	// `pInfo` must be an encoded JSON object.
 	virtual void OnNewInfo(const char *pInfo) = 0;
 };

@@ -15,6 +15,7 @@ clap = { version = "3.1.14", default-features = false, features = [
 ] }
 csv = "1.1.6"
 env_logger = "0.8.3"
+headers = "0.3.7"
 hex = "0.4.3"
 ipnet = { version = "2.5.0", features = ["serde"] }
 log = "0.4.17"
