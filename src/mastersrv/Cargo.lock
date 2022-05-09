@@ -445,6 +445,7 @@ version = "0.0.1"
 dependencies = [
  "arrayvec",
  "base64",
+ "bytes",
  "clap",
  "csv",
  "env_logger",

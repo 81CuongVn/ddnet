@@ -54,28 +54,28 @@ const SERVER_TIMEOUT_SECONDS: u64 = 30;
 type ShortString = ArrayString<64>;
 
 // TODO: make it compile on Windows
+// TODO: perhaps make it restartable? the only thing missing from the dump is the secrets of the
+// challenger.
+// TODO: delete action for server shutdown
 
 #[derive(Debug, Deserialize)]
 struct Register {
     address: Url,
     secret: ShortString,
+    // TODO: naming, why is it called "request"_token?
     connless_request_token: Option<ShortString>,
     challenge_token: Option<ShortString>,
     info_serial: i64,
-    info: json::Value,
+    info: Option<json::Value>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 enum RegisterResponse {
-    Success(RegisterResponseCommon),
-    NeedChallenge(RegisterResponseCommon),
+    Success,
+    NeedChallenge,
+    NeedInfo,
     Error(RegisterError)
-}
-
-#[derive(Debug, Serialize)]
-struct RegisterResponseCommon {
-    address: Addr,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,6 +296,13 @@ struct Servers {
     pub servers: HashMap<ShortString, Server>,
 }
 
+enum AddResult {
+    Added,
+    Refreshed,
+    NeedInfo,
+    Obsolete,
+}
+
 impl Servers {
     fn new() -> Servers {
         Servers {
@@ -308,8 +315,14 @@ impl Servers {
         addr: Addr,
         a_info: AddrInfo,
         info_serial: i64,
-        info: Cow<'_, json::value::RawValue>,
-    ) -> bool {
+        info: Option<Cow<'_, json::value::RawValue>>,
+    ) -> AddResult {
+        let need_info = self.servers.get(&a_info.secret)
+            .map(|entry| info_serial > entry.info_serial)
+            .unwrap_or(true);
+        if need_info && info.is_none() {
+            return AddResult::NeedInfo;
+        }
         let insert_addr;
         let secret = a_info.secret.clone();
         match self.addresses.entry(addr) {
@@ -320,11 +333,11 @@ impl Servers {
             hash_map::Entry::Occupied(mut o) => {
                 if a_info.kind < o.get().kind {
                     // Don't replace masterserver entries with stuff from backcompat.
-                    return false;
+                    return AddResult::Obsolete;
                 }
                 if a_info.ping_time < o.get().ping_time {
                     // Don't replace address info with older one.
-                    return false;
+                    return AddResult::Obsolete;
                 }
                 let old = o.insert(a_info);
                 insert_addr = old.secret != secret;
@@ -343,7 +356,7 @@ impl Servers {
                 v.insert(Server {
                     addresses: vec![addr],
                     info_serial,
-                    info: info.into_owned(),
+                    info: info.unwrap().into_owned(),
                 });
             },
             hash_map::Entry::Occupied(mut o) => {
@@ -354,11 +367,15 @@ impl Servers {
                 }
                 if info_serial > server.info_serial {
                     server.info_serial = info_serial;
-                    server.info = info.into_owned();
+                    server.info = info.unwrap().into_owned();
                 }
             },
         }
-        insert_addr
+        if insert_addr {
+            AddResult::Added
+        } else {
+            AddResult::Refreshed
+        }
     }
     fn prune_before(&mut self, time: Timestamp, log: bool) {
         let mut remove = Vec::new();
@@ -386,7 +403,7 @@ impl Servers {
                 addr,
                 a_info.clone(),
                 server.info_serial,
-                Cow::Borrowed(&server.info),
+                Some(Cow::Borrowed(&server.info)),
             );
         }
     }
@@ -532,6 +549,9 @@ async fn handle_periodic_writeout(
     }
 }
 
+// TODO: Perhaps it would be better to use something other than the `secret` to
+// identify challenges because those can't be changed by the client without
+// creating different results.
 async fn send_challenge(
     connless_request_token_7: Option<[u8; 4]>,
     socket: Arc<tokio::net::UdpSocket>,
@@ -570,10 +590,10 @@ fn handle_register(
         Protocol::V6 => None,
         Protocol::V7 => {
             let token_hex = register.connless_request_token.as_ref().ok_or_else(|| {
-                "registering with tw-0.7+udp:// requires field \"connless_request_token\""
+                "registering with tw-0.7+udp:// requires header Connless-Request-Token"
             })?;
             let mut token = [0; 4];
-            hex::decode_to_slice(token_hex.as_bytes(), &mut token).map_err(|e| RegisterError::new(format!("invalid hex in connless_request_token: {}", e)))?;
+            hex::decode_to_slice(token_hex.as_bytes(), &mut token).map_err(|e| RegisterError::new(format!("invalid hex in Connless-Request-Token: {}", e)))?;
             Some(token)
         },
     };
@@ -596,15 +616,16 @@ fn handle_register(
         .map(|ct| ct != challenge.current())
         .unwrap_or(true);
 
-    let common = RegisterResponseCommon { address: addr };
     let result = if correct_challenge {
-        let info = register.info.as_object().ok_or("register info must be an object")?;
+        let raw_info = register.info.map(|i| -> Result<_, RegisterError> {
+            let info = i.as_object().ok_or("register info must be an object")?;
 
-        // Normalize the JSON to strip any spaces etc.
-        let raw_info = json::to_string(&info).unwrap();
-        let raw_info = json::value::RawValue::from_string(raw_info).unwrap();
+            // Normalize the JSON to strip any spaces etc.
+            let raw_info = json::to_string(&info).unwrap();
+            Ok(json::value::RawValue::from_string(raw_info).unwrap())
+        }).transpose()?;
 
-        if shared.lock_servers().add(
+        let add_result = shared.lock_servers().add(
             addr,
             AddrInfo {
                 kind: EntryKind::Mastersrv,
@@ -613,18 +634,25 @@ fn handle_register(
                 secret: register.secret.clone(),
             },
             register.info_serial,
-            Cow::Owned(raw_info),
-        ) {
-            debug!("successfully registered {}", addr);
+            raw_info.map(Cow::Owned),
+        );
+        match add_result {
+            AddResult::Added => debug!("successfully registered {}", addr),
+            AddResult::Refreshed => {},
+            AddResult::NeedInfo => {},
+            AddResult::Obsolete => warn!("received obsolete entry {}, shouldn't normally happen", addr),
         }
-
-        RegisterResponse::Success(common)
+        if let AddResult::NeedInfo = add_result {
+            RegisterResponse::NeedInfo
+        } else {
+            RegisterResponse::Success
+        }
     } else {
-        RegisterResponse::NeedChallenge(common)
+        RegisterResponse::NeedChallenge
     };
 
     if should_send_challenge {
-        if let RegisterResponse::Success(_) = result {
+        if let RegisterResponse::Success = result {
             debug!("re-sending challenge to {}", addr);
         } else {
             debug!("sending challenge to {}", addr);
@@ -642,9 +670,10 @@ fn handle_register(
     Ok(result)
 }
 
-fn register_from_headers(headers: &warp::http::HeaderMap, info: json::Value)
+fn register_from_headers(headers: &warp::http::HeaderMap, info: &[u8])
     -> Result<Register, RegisterError>
 {
+    // TODO: check content-type. what to do with multiple content-type headers?
     if !headers.contains_key("address") {
         // backward compatibility already, lol
         let json = json::to_string(&info).unwrap();
@@ -676,8 +705,46 @@ fn register_from_headers(headers: &warp::http::HeaderMap, info: json::Value)
         connless_request_token: parse_opt(headers, "Connless-Request-Token")?,
         challenge_token: parse_opt(headers, "Challenge-Token")?,
         info_serial: parse(headers, "Info-Serial")?,
-        info,
+        info: if !info.is_empty() {
+            Some(json::from_slice(info)
+                .map_err(|e| RegisterError::new(format!("Request body deserialize error: {}", e)))?
+            )
+        } else {
+            None
+        },
     })
+}
+
+async fn recover(err: warp::Rejection) -> Result<impl warp::Reply, warp::Rejection> {
+    use warp::http::StatusCode;
+    let (e, status): (&dyn fmt::Display, _) = if err.is_not_found() {
+        (&"Not found", StatusCode::NOT_FOUND)
+    } else if let Some(e) = err.find::<warp::reject::MethodNotAllowed>() {
+        (e, StatusCode::METHOD_NOT_ALLOWED)
+    } else if let Some(e) = err.find::<warp::reject::InvalidHeader>() {
+        (e, StatusCode::BAD_REQUEST)
+    } else if let Some(e) = err.find::<warp::reject::MissingHeader>() {
+        (e, StatusCode::BAD_REQUEST)
+    } else if let Some(e) = err.find::<warp::reject::InvalidQuery>() {
+        (e, StatusCode::BAD_REQUEST)
+    } else if let Some(e) = err.find::<warp::filters::body::BodyDeserializeError>() {
+        (e, StatusCode::BAD_REQUEST)
+    } else if let Some(e) = err.find::<warp::reject::LengthRequired>() {
+        (e, StatusCode::LENGTH_REQUIRED)
+    } else if let Some(e) = err.find::<warp::reject::PayloadTooLarge>() {
+        (e, StatusCode::PAYLOAD_TOO_LARGE)
+    } else if let Some(e) = err.find::<warp::reject::UnsupportedMediaType>() {
+        (e, StatusCode::UNSUPPORTED_MEDIA_TYPE)
+    } else {
+        return Err(err);
+    };
+
+    let response = RegisterResponse::Error(RegisterError::new(format!("{}", e)));
+    Ok(warp::http::Response::builder()
+        .status(status)
+        .header(warp::http::header::CONTENT_TYPE, "application/json")
+        .body(json::to_string(&response).unwrap() + "\n")
+    )
 }
 
 #[derive(Clone)]
@@ -769,17 +836,15 @@ async fn main() {
         timekeeper,
     ));
 
-    // TODO: put all fields except the server info into http headers for better
-    // HPACK/QPACK compression?
     let register = warp::post()
         .and(warp::path!("ddnet"/"15"/"register"))
         .and(warp::header::headers_cloned())
         .and(warp::addr::remote())
         .and(warp::body::content_length_limit(16 * 1024)) // limit body size to 16 KiB
-        .and(warp::body::json())
-        .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, info: json::Value| {
+        .and(warp::body::bytes())
+        .map(move |headers: warp::http::HeaderMap, addr: Option<SocketAddr>, info: bytes::Bytes| {
             let (http_status, body) = match panic::catch_unwind(|| {
-                let register = register_from_headers(&headers, info)?;
+                let register = register_from_headers(&headers, &info)?;
                 let shared = Shared {
                     challenger: &challenger,
                     locations: &locations,
@@ -812,12 +877,12 @@ async fn main() {
                 Ok(Err(e)) => (warp::http::StatusCode::BAD_REQUEST, RegisterResponse::Error(e)),
                 Err(_) => (warp::http::StatusCode::INTERNAL_SERVER_ERROR, RegisterResponse::Error("unexpected panic".into())),
             };
-            let body = json::to_string(&body).unwrap();
-            // TODO: better error responses when generated by warp
             warp::http::Response::builder()
                 .status(http_status)
-                .body(body)
-        });
+                .header(warp::http::header::CONTENT_TYPE, "application/json")
+                .body(json::to_string(&body).unwrap() + "\n")
+        })
+        .recover(recover);
     let server = warp::serve(register);
 
     let task_server = if let Some(path) = listen_unix {

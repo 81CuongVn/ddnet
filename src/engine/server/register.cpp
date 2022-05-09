@@ -16,8 +16,8 @@ class CRegister : public IRegister
 	{
 		STATUS_NONE = 0,
 		STATUS_OK,
-		STATUS_FAILED,
 		STATUS_NEEDCHALLENGE,
+		STATUS_NEEDINFO,
 
 		PROTOCOL_TW6_IPV6 = 0,
 		PROTOCOL_TW6_IPV4,
@@ -146,6 +146,10 @@ bool CRegister::StatusFromString(int *pResult, const char *pString)
 	else if(str_comp(pString, "need_challenge") == 0)
 	{
 		*pResult = STATUS_NEEDCHALLENGE;
+	}
+	else if(str_comp(pString, "need_info") == 0)
+	{
+		*pResult = STATUS_NEEDINFO;
 	}
 	else
 	{
@@ -281,7 +285,7 @@ void CRegister::CProtocol::SendRegister()
 
 	lock_wait(m_pShared->m_pGlobal->m_Lock);
 	int InfoSerial = m_pShared->m_pGlobal->m_InfoSerial;
-	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial || true; // NOLINT(readability-simplify-boolean-expr)
+	bool SendInfo = InfoSerial > m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial;
 	lock_unlock(m_pShared->m_pGlobal->m_Lock);
 
 	// TODO: Don't send info if the master already knows it.
@@ -331,14 +335,24 @@ CRegister::CProtocol::CProtocol(CRegister *pParent, int Protocol) :
 
 void CRegister::CProtocol::CheckChallengeStatus()
 {
-	if(!m_NewChallengeToken)
-	{
-		return;
-	}
 	lock_wait(m_pShared->m_Lock);
-	if(m_pShared->m_LatestResponseStatus == STATUS_NEEDCHALLENGE && m_pShared->m_LatestResponseIndex == m_NumTotalRequests - 1)
+	// No requests in flight?
+	if(m_pShared->m_LatestResponseIndex == m_NumTotalRequests - 1)
 	{
-		m_NextRegister = time_get();
+		switch(m_pShared->m_LatestResponseStatus)
+		{
+		case STATUS_NEEDCHALLENGE:
+			if(m_NewChallengeToken)
+			{
+				// Immediately resend if we got the token.
+				m_NextRegister = time_get();
+			}
+			break;
+		case STATUS_NEEDINFO:
+			// Act immediately if the master requests more info.
+			m_NextRegister = time_get();
+			break;
+		}
 	}
 	lock_unlock(m_pShared->m_Lock);
 }
@@ -421,7 +435,16 @@ void CRegister::CProtocol::CJob::Run()
 		{
 			m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial = m_InfoSerial;
 		}
-		// TODO: resend info if the masterserver claims to not know ours
+		lock_unlock(m_pShared->m_pGlobal->m_Lock);
+	}
+	else if(Status == STATUS_NEEDINFO)
+	{
+		lock_wait(m_pShared->m_pGlobal->m_Lock);
+		if(m_InfoSerial == m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial)
+		{
+			// Tell other requests that they need to send the info again.
+			m_pShared->m_pGlobal->m_LatestSuccessfulInfoSerial -= 1;
+		}
 		lock_unlock(m_pShared->m_pGlobal->m_Lock);
 	}
 }
