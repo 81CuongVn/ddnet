@@ -127,7 +127,7 @@ class CRegister : public IRegister
 	char m_aVerifyPacket[sizeof(SERVERBROWSE_CHALLENGE) + UUID_MAXSTRSIZE];
 	CUuid m_Secret = RandomUuid();
 	bool m_GotServerInfo = false;
-	char m_aServerInfo[1024];
+	char m_aServerInfo[16384];
 
 public:
 	CRegister(CConfig *pConfig, IConsole *pConsole, IEngine *pEngine, int ServerPort, unsigned SixupSecurityToken);
