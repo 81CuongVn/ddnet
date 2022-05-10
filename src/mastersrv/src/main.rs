@@ -61,7 +61,7 @@ struct Register {
     address: Url,
     secret: ShortString,
     connless_request_token: Option<ShortString>,
-    challenge_secret: Option<ShortString>,
+    challenge_secret: ShortString,
     challenge_token: Option<ShortString>,
     info_serial: i64,
     info: Option<json::Value>,
@@ -701,7 +701,7 @@ fn handle_register(
             connless_request_token_7,
             shared.socket.clone(),
             SocketAddr::new(remote_addr, port),
-            register.challenge_secret.unwrap_or(register.secret),
+            register.challenge_secret,
             challenge.current,
         ));
     }
@@ -712,12 +712,6 @@ fn handle_register(
 fn register_from_headers(headers: &warp::http::HeaderMap, info: &[u8])
     -> Result<Register, RegisterError>
 {
-    if !headers.contains_key("address") {
-        // backward compatibility already, lol
-        let json = json::to_string(&info).unwrap();
-        return json::from_str(&json)
-            .map_err(|e| RegisterError::new(format!("invalid register object: {}", e)));
-    }
     fn parse_opt<T: str::FromStr>(headers: &warp::http::HeaderMap, name: &str)
         -> Result<Option<T>, RegisterError>
         where T::Err: fmt::Display,
@@ -741,7 +735,7 @@ fn register_from_headers(headers: &warp::http::HeaderMap, info: &[u8])
         address: parse(headers, "Address")?,
         secret: parse(headers, "Secret")?,
         connless_request_token: parse_opt(headers, "Connless-Token")?,
-        challenge_secret: Some(parse(headers, "Challenge-Secret")?),
+        challenge_secret: parse(headers, "Challenge-Secret")?,
         challenge_token: parse_opt(headers, "Challenge-Token")?,
         info_serial: parse(headers, "Info-Serial")?,
         info: if !info.is_empty() {
