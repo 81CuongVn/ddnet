@@ -64,7 +64,7 @@ class CRegister : public IRegister
 
 			std::shared_ptr<CGlobal> m_pGlobal;
 			LOCK m_Lock = lock_create();
-			bool m_Registered GUARDED_BY(m_Lock) = false;
+			int m_NumTotalRequests GUARDED_BY(m_Lock) = 0;
 			int m_LatestResponseStatus GUARDED_BY(m_Lock) = STATUS_NONE;
 			int m_LatestResponseIndex GUARDED_BY(m_Lock) = -1;
 		};
@@ -72,6 +72,7 @@ class CRegister : public IRegister
 		class CJob : public IJob
 		{
 			int m_Protocol;
+			int m_ServerPort;
 			int m_Index;
 			int m_InfoSerial;
 			std::shared_ptr<CShared> m_pShared;
@@ -79,8 +80,9 @@ class CRegister : public IRegister
 			virtual void Run();
 
 		public:
-			CJob(int Protocol, int Index, int InfoSerial, std::shared_ptr<CShared> pShared, std::unique_ptr<CHttpRequest> &&pRegister) :
+			CJob(int Protocol, int ServerPort, int Index, int InfoSerial, std::shared_ptr<CShared> pShared, std::unique_ptr<CHttpRequest> &&pRegister) :
 				m_Protocol(Protocol),
+				m_ServerPort(ServerPort),
 				m_Index(Index),
 				m_InfoSerial(InfoSerial),
 				m_pShared(std::move(pShared)),
@@ -94,7 +96,6 @@ class CRegister : public IRegister
 		int m_Protocol;
 
 		std::shared_ptr<CShared> m_pShared;
-		int m_NumTotalRequests = 0;
 		bool m_NewChallengeToken = false;
 		bool m_HaveChallengeToken = false;
 		char m_aChallengeToken[128] = {0};
@@ -297,14 +298,15 @@ void CRegister::CProtocol::SendRegister()
 	pRegister->IpResolve(ProtocolToIpresolve(m_Protocol));
 
 	lock_wait(m_pShared->m_Lock);
-	if(!m_pShared->m_Registered)
+	if(m_pShared->m_LatestResponseStatus != STATUS_OK)
 	{
 		log_info(ProtocolToSystem(m_Protocol), "registering...");
 	}
+	int RequestIndex = m_pShared->m_NumTotalRequests;
+	m_pShared->m_NumTotalRequests += 1;
 	lock_unlock(m_pShared->m_Lock);
-	m_pParent->m_pEngine->AddJob(std::make_shared<CJob>(m_Protocol, m_NumTotalRequests, InfoSerial, m_pShared, std::move(pRegister)));
+	m_pParent->m_pEngine->AddJob(std::make_shared<CJob>(m_Protocol, m_pParent->m_ServerPort, RequestIndex, InfoSerial, m_pShared, std::move(pRegister)));
 	m_NewChallengeToken = false;
-	m_NumTotalRequests += 1;
 
 	m_PrevRegister = Now;
 	m_NextRegister = Now + 15 * Freq;
@@ -321,7 +323,7 @@ void CRegister::CProtocol::CheckChallengeStatus()
 {
 	lock_wait(m_pShared->m_Lock);
 	// No requests in flight?
-	if(m_pShared->m_LatestResponseIndex == m_NumTotalRequests - 1)
+	if(m_pShared->m_LatestResponseIndex == m_pShared->m_NumTotalRequests - 1)
 	{
 		switch(m_pShared->m_LatestResponseStatus)
 		{
@@ -343,12 +345,6 @@ void CRegister::CProtocol::CheckChallengeStatus()
 
 void CRegister::CProtocol::Update()
 {
-	lock_wait(m_pShared->m_Lock);
-	if(m_pShared->m_LatestResponseIndex == m_NumTotalRequests - 1)
-	{
-		m_pShared->m_Registered = m_pShared->m_LatestResponseStatus == STATUS_OK;
-	}
-	lock_unlock(m_pShared->m_Lock);
 	CheckChallengeStatus();
 	if(time_get() >= m_NextRegister)
 	{
@@ -401,9 +397,14 @@ void CRegister::CProtocol::CJob::Run()
 		return;
 	}
 	lock_wait(m_pShared->m_Lock);
-	if(Status != STATUS_OK || !m_pShared->m_Registered)
+	if(Status != STATUS_OK || Status != m_pShared->m_LatestResponseStatus)
 	{
 		log_debug(ProtocolToSystem(m_Protocol), "status: %s", (const char *)StatusString);
+	}
+	if(Status == m_pShared->m_LatestResponseStatus)
+	{
+		log_error(ProtocolToSystem(m_Protocol), "ERROR: the master server reports that clients can not connect to this server.");
+		log_error(ProtocolToSystem(m_Protocol), "ERROR: configure your firewall/nat to let through udp on port %d.", m_ServerPort);
 	}
 	json_value_free(pJson);
 	if(m_Index > m_pShared->m_LatestResponseIndex)
